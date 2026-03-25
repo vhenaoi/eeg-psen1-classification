@@ -1,0 +1,39 @@
+# Data files — never commit patient data
+*.feather
+*.pkl
+*.pkl.gz
+*.h5
+*.csv
+*.xlsx
+*.xls
+
+# Outputs and results
+Resultados/
+graphics/
+*.docx
+*.png
+*.jpg
+*.pdf
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
