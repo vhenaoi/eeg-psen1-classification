@@ -10,6 +10,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import NearestNeighbors
 import matplotlib.pyplot as plt
 from scipy import stats
+from scipy.optimize import linear_sum_assignment
 
 
 def calculate_smd(treatment, control, variable_name=''):
@@ -416,141 +417,134 @@ def calculate_propensity_scores(subject_data, matching_covariates=None):
         return None, []
 
 
-def perform_nn_matching_subjects(g1_subjects, g2_subjects, g1_prop_scores, g2_prop_scores, 
+def perform_nn_matching_subjects(g1_subjects, g2_subjects, g1_prop_scores, g2_prop_scores,
                                   group1, group2, ratio_multiplier, caliper=0.2):
     """
-    SUBJECT-LEVEL MATCHING: Nearest Neighbor WITHOUT replacement
-    
-    Returns list of matched subject IDs, not rows
-    
-    Parameters:
-    -----------
-    g1_subjects : DataFrame
-        Treatment subjects (one row per subject)
-    g2_subjects : DataFrame
-        Control subjects (one row per subject)
+    SUBJECT-LEVEL MATCHING: Optimal 1:1 or constrained-greedy k:1, WITHOUT replacement.
+
+    For 1:1  — uses linear_sum_assignment (globally optimal: maximises matched
+               pairs and minimises total PS distance simultaneously).
+
+    For k:1  — uses greedy nearest-neighbour with "most constrained first"
+               ordering: treatment subjects with the fewest controls in their
+               caliper window are processed first, preventing the most restricted
+               subjects from being left without controls by less-constrained ones.
+               The linear_sum_assignment objective (minimise total cost) does not
+               maximise the number of treatments that receive exactly k controls,
+               so greedy with optimal ordering outperforms it for k > 1.
+
+    Parameters
+    ----------
+    g1_subjects : DataFrame  (one row per treatment subject)
+    g2_subjects : DataFrame  (one row per control subject)
     g1_prop_scores : array
-        Treatment propensity scores
     g2_prop_scores : array
-        Control propensity scores
     group1 : str
-        Treatment group name
     group2 : str
-        Control group name
-    ratio_multiplier : int
-        Number of controls per treatment
-    caliper : float
-        Maximum allowed distance in SD units
-    
-    Returns:
-    --------
-    list : Subject IDs of matched subjects
+    ratio_multiplier : int   controls per treatment subject (k)
+    caliper : float          max PS distance in SD units
+
+    Returns
+    -------
+    list : subject IDs of all matched subjects (treatment + control)
     """
-    print(f"\nPerforming Nearest Neighbor matching (WITHOUT replacement)...")
-    print(f"  Matching at SUBJECT level (not row level)")
-    
-    # Reset indices to avoid confusion
     g1_subjects = g1_subjects.reset_index(drop=True)
     g2_subjects = g2_subjects.reset_index(drop=True)
-    
-    # Calculate caliper in absolute PS units
+
     all_scores = np.concatenate([g1_prop_scores, g2_prop_scores])
     caliper_absolute = caliper * np.std(all_scores)
-    
-    print(f"  Caliper: {caliper} SD = {caliper_absolute:.3f} in PS units")
+
+    n_treat = len(g1_subjects)
+    n_ctrl  = len(g2_subjects)
+
+    print(f"  Caliper: {caliper} SD = {caliper_absolute:.4f} in PS units")
     print(f"  Target ratio: 1:{ratio_multiplier}")
-    
-    # Track which controls have been used (matching without replacement)
-    available_controls = set(range(len(g2_subjects)))
-    
-    matched_pairs = []  # List of (treatment_idx, [control_indices])
-    subjects_outside_caliper = 0
-    subjects_insufficient_controls = 0
-    
-    # For each treatment subject, find closest controls
-    for i in range(len(g1_subjects)):
-        treat_ps = g1_prop_scores[i]
-        
-        # Check if we have enough available controls
-        if len(available_controls) < ratio_multiplier:
-            subjects_insufficient_controls += 1
-            continue
-        
-        # Calculate distances to all available controls
-        distances = []
-        control_indices = []
-        
-        for ctrl_idx in available_controls:
-            dist = abs(g2_prop_scores[ctrl_idx] - treat_ps)
-            distances.append(dist)
-            control_indices.append(ctrl_idx)
-        
-        distances = np.array(distances)
-        control_indices = np.array(control_indices)
-        
-        # Sort by distance
-        sorted_idx = np.argsort(distances)
-        distances_sorted = distances[sorted_idx]
-        controls_sorted = control_indices[sorted_idx]
-        
-        # Select closest controls within caliper
-        selected_controls = []
-        for dist, ctrl_idx in zip(distances_sorted, controls_sorted):
-            if dist <= caliper_absolute:
-                selected_controls.append(ctrl_idx)
-                if len(selected_controls) == ratio_multiplier:
-                    break
-        
-        # Only keep this treatment if we found enough controls
-        if len(selected_controls) == ratio_multiplier:
-            matched_pairs.append((i, selected_controls))
-            # Remove used controls from available pool (NO REPLACEMENT)
-            for ctrl_idx in selected_controls:
-                available_controls.remove(ctrl_idx)
-        else:
-            # Not enough controls within caliper
-            subjects_outside_caliper += 1
-    
-    # Report matching results
+
+    # ------------------------------------------------------------------
+    # 1:1  — globally optimal via linear_sum_assignment
+    # ------------------------------------------------------------------
+    if ratio_multiplier == 1:
+        print(f"\nPerforming Optimal 1:1 Matching (linear_sum_assignment)...")
+
+        PENALTY = 1e9
+        cost_matrix = np.abs(g1_prop_scores[:, None] - g2_prop_scores[None, :])
+        cost_matrix[cost_matrix > caliper_absolute] = PENALTY
+
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+        matched_pairs = [
+            (r, [c]) for r, c in zip(row_ind, col_ind)
+            if cost_matrix[r, c] < PENALTY
+        ]
+
+    # ------------------------------------------------------------------
+    # k:1  — greedy nearest-neighbour, most-constrained-first ordering
+    # ------------------------------------------------------------------
+    else:
+        print(f"\nPerforming Greedy k:1 Matching (most-constrained-first)...")
+
+        # Count controls within caliper for each treatment — process most
+        # restricted subjects first so they are not crowded out
+        n_in_caliper = np.array([
+            np.sum(np.abs(g2_prop_scores - g1_prop_scores[i]) <= caliper_absolute)
+            for i in range(n_treat)
+        ])
+        processing_order = np.argsort(n_in_caliper)
+        print(f"  Controls in caliper per treatment: "
+              f"min={n_in_caliper.min():.0f}, max={n_in_caliper.max():.0f}")
+
+        available = set(range(n_ctrl))
+        matched_pairs = []
+
+        for i in processing_order:
+            treat_ps = g1_prop_scores[i]
+            ctrl_idx  = np.array(sorted(available))
+            dists     = np.abs(g2_prop_scores[ctrl_idx] - treat_ps)
+            order     = np.argsort(dists)
+            selected  = [ctrl_idx[j] for j in order
+                         if dists[j] <= caliper_absolute][:ratio_multiplier]
+
+            if len(selected) == ratio_multiplier:
+                matched_pairs.append((i, selected))
+                available -= set(selected)
+
+    # ------------------------------------------------------------------
+    # Common reporting and output
+    # ------------------------------------------------------------------
+    n_matched   = len(matched_pairs)
+    n_failed    = n_treat - n_matched
+    n_ctrl_used = n_matched * ratio_multiplier
+
     print(f"\n  Matching results:")
-    print(f"    Treatments successfully matched: {len(matched_pairs)}")
-    print(f"    Treatments outside caliper: {subjects_outside_caliper}")
-    print(f"    Treatments with insufficient controls: {subjects_insufficient_controls}")
-    print(f"    Controls used: {len(matched_pairs) * ratio_multiplier}")
-    print(f"    Controls remaining: {len(available_controls)}")
-    
-    if len(matched_pairs) == 0:
+    print(f"    Treatments successfully matched: {n_matched}")
+    print(f"    Treatments failed (insufficient controls in caliper): {n_failed}")
+    print(f"    Controls used: {n_ctrl_used}")
+    print(f"    Controls remaining: {n_ctrl - n_ctrl_used}")
+
+    if n_matched == 0:
         print(f"\n  [X] ERROR: No matches found within caliper!")
         print(f"  Suggestions:")
         print(f"    1. Increase caliper (current: {caliper})")
         print(f"    2. Use smaller ratio")
         print(f"    3. Check propensity score overlap")
         return []
-    
-    # Build list of matched SUBJECT IDs
-    matched_treatment_indices = [pair[0] for pair in matched_pairs]
-    matched_control_indices = [ctrl for pair in matched_pairs for ctrl in pair[1]]
-    
-    # Get subject IDs
-    matched_treatment_subjects = g1_subjects.iloc[matched_treatment_indices]['subject'].tolist()
-    matched_control_subjects = g2_subjects.iloc[matched_control_indices]['subject'].tolist()
-    
-    # Combine all matched subjects
+
+    matched_treatment_subjects = [g1_subjects.iloc[i]['subject'] for i, _ in matched_pairs]
+    matched_control_subjects   = [g2_subjects.iloc[c]['subject']
+                                   for _, ctrls in matched_pairs for c in ctrls]
     all_matched_subjects = matched_treatment_subjects + matched_control_subjects
-    
-    # CRITICAL VERIFICATION
-    n_treatment = len(matched_treatment_subjects)
-    n_control = len(matched_control_subjects)
-    
-    assert n_control == n_treatment * ratio_multiplier, "Control count mismatch!"
-    assert len(set(all_matched_subjects)) == len(all_matched_subjects), "Duplicate subjects detected!"
-    
+
+    assert len(matched_control_subjects) == n_matched * ratio_multiplier, \
+        "Control count mismatch!"
+    assert len(set(all_matched_subjects)) == len(all_matched_subjects), \
+        "Duplicate subjects detected!"
+
     print(f"\n  [OK] Matched subjects:")
-    print(f"    {group1}: {n_treatment} subjects")
-    print(f"    {group2}: {n_control} subjects")
+    print(f"    {group1}: {n_matched} subjects")
+    print(f"    {group2}: {len(matched_control_subjects)} subjects")
     print(f"    Total: {len(all_matched_subjects)} subjects")
-    print(f"    Actual ratio: 1:{n_control/n_treatment:.2f}")
-    
+    print(f"    Actual ratio: 1:{len(matched_control_subjects)/n_matched:.2f}")
+
     return all_matched_subjects
 
 

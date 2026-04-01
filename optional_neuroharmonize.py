@@ -15,6 +15,9 @@ Output : One complete harmonized dataframe (all metrics)
 import os
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy.stats import gaussian_kde
 from neuroHarmonize import harmonizationLearn, harmonizationApply
 import pickle
 
@@ -49,7 +52,50 @@ COMPONENTS = {
 
 # Columns that are covariates/metadata — must not be harmonized
 COVARIATE_COLS = ['age', 'sex', 'gender', 'SITE', 'education', 'education_cross',
-                  'diagnosis', 'subject_id', 'session', 'database', 'group']
+                  'diagnosis', 'subject_id', 'subject', 'session', 'database', 'group']
+
+# Metadata duplicates produced by each metric's dataframe (group_sl, age_coh, etc.)
+# These must be excluded from harmonization — they are not EEG features.
+METRIC_METADATA = {
+    'power':    [],
+    'sl':       ['group_sl',    'age_sl',    'SITE_sl'],
+    'cohfreq':  ['group_coh',   'age_coh',   'SITE_coh'],
+    'entropy':  ['group_ent',   'age_ent',   'SITE_ent'],
+    'crossfreq': ['group_cross', 'age_cross', 'SITE_cross'],
+}
+
+
+def get_metric_feature_cols(data_cols, metric):
+    """
+    Return only the true feature columns for a given metric type.
+    Column naming conventions:
+      power    — channel_band format, no suffix, no '/'  (e.g. C3_Alpha-1)
+      sl       — ends with '_sl'                          (e.g. C3_Alpha-1_sl)
+      cohfreq  — ends with '_coh'                         (e.g. C3_Alpha-1_coh)
+      entropy  — ends with '_ent'                         (e.g. C3_Alpha-1_ent)
+      crossfreq— contains '/'                             (e.g. C3_Alpha-1/MAlpha-1)
+    """
+    exclude = set(COVARIATE_COLS) | set(METRIC_METADATA.get(metric, []))
+    # also exclude ALL metric-metadata variants regardless of current metric
+    for meta_list in METRIC_METADATA.values():
+        exclude.update(meta_list)
+
+    all_suffixes = ('_sl', '_coh', '_ent', '_cross')
+
+    if metric == 'power':
+        return [c for c in data_cols
+                if c not in exclude
+                and '/' not in c
+                and not any(c.endswith(s) for s in all_suffixes)]
+    elif metric == 'sl':
+        return [c for c in data_cols if c not in exclude and c.endswith('_sl')]
+    elif metric == 'cohfreq':
+        return [c for c in data_cols if c not in exclude and c.endswith('_coh')]
+    elif metric == 'entropy':
+        return [c for c in data_cols if c not in exclude and c.endswith('_ent')]
+    elif metric == 'crossfreq':
+        return [c for c in data_cols if c not in exclude and '/' in c]
+    return []
 
 
 # ============================================================================
@@ -157,6 +203,106 @@ def harmonize_block_reference(
 
     df_adj = pd.DataFrame(X_all_adj, columns=cols_to_harmonize, index=block_all.index)
     return df_adj, model
+
+
+def plot_combat_parameters(models, site_mapping, output_path):
+    """
+    Plot distributions of ComBat gamma (additive) and delta (multiplicative)
+    parameters across features, one curve per site.
+
+    gamma_star: additive site offset — values near 0 mean no additive correction.
+    delta_star: multiplicative site scaling of variance — values near 1 mean no
+                scaling correction. Plotted in log scale (log(delta)) so the
+                symmetric reference is 0.
+
+    One figure is produced per metric type and saved to output_path.
+
+    Parameters
+    ----------
+    models : dict  {metric_name: neuroHarmonize_model_dict}
+    site_mapping : dict  {site_name: integer_code}
+    output_path : str
+    """
+    # Reverse mapping: integer code -> site name
+    code_to_site = {v: k for k, v in site_mapping.items()}
+
+    for metric, model in models.items():
+        if model is None:
+            continue
+
+        gamma = model.get('gamma_star')   # shape: (n_sites, n_features)
+        delta = model.get('delta_star')   # shape: (n_sites, n_features)
+        batch_levels = model.get('info_dict', {}).get('batch_levels', [])
+
+        if gamma is None or delta is None:
+            continue
+
+        n_sites = gamma.shape[0]
+        site_labels = [code_to_site.get(int(b), f'Site {b}') for b in batch_levels]
+
+        # Color palette — one color per site
+        cmap = plt.cm.get_cmap('tab10', n_sites)
+        colors = [cmap(i) for i in range(n_sites)]
+
+        label = 'All EEG features' if metric == 'all_features' else metric.upper()
+        fig = plt.figure(figsize=(14, 6))
+        fig.suptitle(
+            f'ComBat site-effect parameters — {label}\n'
+            f'(estimated from Controls only, reference-based harmonization)',
+            fontsize=12, fontweight='bold', y=0.98
+        )
+        gs = gridspec.GridSpec(1, 2, figure=fig)
+
+        # --- Left panel: gamma (additive effects) ---
+        ax_g = fig.add_subplot(gs[0])
+        for idx in range(n_sites):
+            vals = gamma[idx, :]
+            vals = vals[np.isfinite(vals)]
+            if len(vals) < 3:
+                continue
+            xs = np.linspace(vals.min() - 0.5, vals.max() + 0.5, 300)
+            try:
+                kde = gaussian_kde(vals, bw_method='scott')
+                ax_g.plot(xs, kde(xs), color=colors[idx],
+                          label=site_labels[idx], linewidth=1.8)
+            except Exception:
+                pass
+
+        ax_g.axvline(0, color='black', linestyle='--', linewidth=1, alpha=0.6)
+        ax_g.set_xlabel('gamma* (additive site effect)', fontsize=11)
+        ax_g.set_ylabel('Density', fontsize=11)
+        ax_g.set_title('Additive effects (gamma*)', fontsize=11)
+        ax_g.legend(fontsize=7, loc='upper right', framealpha=0.7)
+        ax_g.grid(True, alpha=0.3)
+
+        # --- Right panel: log(delta) (multiplicative / variance scaling) ---
+        ax_d = fig.add_subplot(gs[1])
+        for idx in range(n_sites):
+            vals = delta[idx, :]
+            vals = vals[np.isfinite(vals) & (vals > 0)]
+            if len(vals) < 3:
+                continue
+            log_vals = np.log(vals)
+            xs = np.linspace(log_vals.min() - 0.5, log_vals.max() + 0.5, 300)
+            try:
+                kde = gaussian_kde(log_vals, bw_method='scott')
+                ax_d.plot(xs, kde(xs), color=colors[idx],
+                          label=site_labels[idx], linewidth=1.8)
+            except Exception:
+                pass
+
+        ax_d.axvline(0, color='black', linestyle='--', linewidth=1, alpha=0.6)
+        ax_d.set_xlabel('log(delta*) [multiplicative site effect]', fontsize=11)
+        ax_d.set_ylabel('Density', fontsize=11)
+        ax_d.set_title('Multiplicative effects — log(delta*)', fontsize=11)
+        ax_d.legend(fontsize=7, loc='upper right', framealpha=0.7)
+        ax_d.grid(True, alpha=0.3)
+
+        fig.subplots_adjust(top=0.88, wspace=0.35)
+        out_file = os.path.join(output_path, f'combat_params_{metric}.png')
+        fig.savefig(out_file, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        print(f"  [OK] Gamma/delta plot saved: {out_file}")
 
 
 def save_harmonization_report(data_original, data_harmonized, output_path,
@@ -279,7 +425,7 @@ def main():
           f"range=[{covars_all_df['age'].min():.0f}, {covars_all_df['age'].max():.0f}]")
 
     # ------------------------------------------------------------------
-    # [4] Reference-based harmonization
+    # [4] Reference-based harmonization — independently per feature type
     # ------------------------------------------------------------------
     print("\n[4/6] Reference-based harmonization (learn on Controls, apply to all)...")
     models = {}
@@ -288,35 +434,14 @@ def main():
         print(f"\n  Processing metric: {metric.upper()}")
         print("  " + "-" * 60)
 
-        _, block_ref = select(
-            data_ref_clean, metric,
-            Gamma='power', space=SPACE, spatial_matrix=ICA
-        )
-        _, block_all = select(
-            data_all_clean, metric,
-            Gamma='power', space=SPACE, spatial_matrix=ICA
-        )
-
-        if block_ref.empty or block_all.empty:
-            print(f"  [!] Warning: empty block for '{metric}'. Skipping...")
+        feat_cols = get_metric_feature_cols(data_ref_clean.columns, metric)
+        if not feat_cols:
+            print(f"  [!] No feature columns found for '{metric}'. Skipping...")
             continue
+        print(f"  Found {len(feat_cols)} feature columns for {metric}")
 
-        # Remove database column
-        if 'database' in block_ref.columns:
-            block_ref = block_ref.drop(columns=['database'])
-        if 'database' in block_all.columns:
-            block_all = block_all.drop(columns=['database'])
-
-        # Filter components in IC space
-        if SPACE == 'ic':
-            block_ref = extract_components_interes(block_ref, COMPONENTS[ICA])
-            block_all = extract_components_interes(block_all, COMPONENTS[ICA])
-            valid_components = COMPONENTS[ICA]
-            for blk_name, blk in [('ref', block_ref), ('all', block_all)]:
-                cols_to_drop = [c for c in blk.columns
-                                if c.startswith('C') and c not in valid_components]
-                if cols_to_drop:
-                    blk.drop(columns=cols_to_drop, inplace=True)
+        block_ref = data_ref_clean[feat_cols].copy()
+        block_all = data_all_clean[feat_cols].copy()
 
         # Two-step harmonization
         metric_harmonized, model = harmonize_block_reference(
@@ -361,6 +486,9 @@ def main():
     print("\n[REPORT] Generating harmonization report...")
     save_harmonization_report(data, data_harmonized, MODEL_PATH,
                                n_ref=n_ref, n_total=n_total)
+
+    print("\n[PLOTS] Generating gamma/delta parameter plots...")
+    plot_combat_parameters(models, site_mapping, MODEL_PATH)
 
     print("\n" + "=" * 80)
     print("HARMONIZATION COMPLETED SUCCESSFULLY")

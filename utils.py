@@ -50,9 +50,11 @@ def covars(data):
     """
     Extract covariates for harmonization.
 
-    Always includes SITE (batch) and age (biological covariate).
-    If 'sex' is present, it is encoded (F=0, M=1) and missing values are
-    imputed with the site-level mode so neuroHarmonize receives no NaNs.
+    Includes SITE (batch) and age (biological covariate).
+    Sex is intentionally excluded: 47% of controls (Seoul, n=210) and 45% of
+    PSEN1 carriers (Medellin_ld, n=41) have no sex data. Imputing a neutral
+    value (0.5) for entire sites is not physiologically defensible, so age
+    alone is used as the biological covariate to protect within-group variation.
 
     Returns
     -------
@@ -62,25 +64,6 @@ def covars(data):
         'SITE': data['SITE'].to_numpy(),
         'age':  data['age'].to_numpy(),
     }
-
-    # --- sex: encode + site-mode imputation ---
-    if 'sex' in data.columns:
-        sex_enc = data['sex'].map(
-            {'F': 0.0, 'Female': 0.0, 'f': 0.0,
-             'M': 1.0, 'Male':   1.0, 'H': 1.0, 'm': 1.0}
-        ).astype(float)
-
-        if sex_enc.isna().any() and 'SITE' in data.columns:
-            for site in data['SITE'].unique():
-                site_mask = data['SITE'] == site
-                mode_vals = sex_enc[site_mask].dropna().mode()
-                if len(mode_vals) > 0:
-                    fill_mask = site_mask & sex_enc.isna()
-                    sex_enc = sex_enc.copy()
-                    sex_enc[fill_mask] = float(mode_vals.iloc[0])
-
-        sex_enc = sex_enc.fillna(0.5)   # global fallback (unknown sex -> midpoint)
-        covars_dict['sex'] = sex_enc.to_numpy()
 
     cols_to_remove = [
         'group', 'subject', 'age', 'sex', 'education',
