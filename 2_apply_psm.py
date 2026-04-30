@@ -353,7 +353,7 @@ if __name__ == "__main__":
     GROUP1  = 'PSEN1'
     GROUP2  = ['Control', 'Relative']
 
-    RATIOS  = ['1:1', '2:1', '5:1']
+    RATIOS  = ['1:1', '2:1', '4:1','5:1']
     CALIPER = 0.2
     RUN_DIAGNOSTICS = True
 
