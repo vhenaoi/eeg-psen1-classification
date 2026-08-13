@@ -139,17 +139,20 @@ def run_sage(model, X_fs, y, feature_names_fs, out_dir, condition_name, clf_name
         print(f"  SAGE: {clf_name} sin predict_proba — omitido")
         return None
 
-    n_bg   = min(512, len(X_fs))
+    n_bg              = min(256, len(X_fs))
+    N_SAGE_PERMUTATIONS = 512
     rng    = np.random.default_rng(RANDOM_STATE)
     bg_idx = rng.choice(len(X_fs), size=n_bg, replace=False)
     X_bg   = X_fs[bg_idx]
     y_bg   = np.asarray(y)[bg_idx]
 
-    print(f"  SAGE — {clf_name} | n={n_bg} | detect_convergence=True ...")
+    print(f"  SAGE — {clf_name} | n={n_bg} | permutations={N_SAGE_PERMUTATIONS} ...")
     try:
         imputer_s = sage.MarginalImputer(model, X_bg)
         estimator = sage.PermutationEstimator(imputer_s, 'cross entropy')
-        sv        = estimator(X_bg, y_bg, detect_convergence=True,
+        sv        = estimator(X_bg, y_bg,
+                              detect_convergence=False,
+                              n_permutations=N_SAGE_PERMUTATIONS,
                               verbose=False, bar=False)
 
         vals    = np.array(sv.values)

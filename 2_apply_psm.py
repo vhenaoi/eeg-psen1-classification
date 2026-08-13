@@ -346,7 +346,8 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # Configuration
     # -------------------------------------------------------------------------
-    BASE_PATH = r'E:\Academico\Universidad\Posgrado\Tesis\Datos\PORTABLES\Resultados'
+    from config import BASE_PATH
+    BASE_PATH = os.path.join(BASE_PATH, 'Resultados')
     DATA_TYPE = 'ce'
     SPACE     = 'roi'
 

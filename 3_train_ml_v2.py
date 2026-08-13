@@ -32,6 +32,7 @@ import joblib
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.linear_model import LogisticRegression, LinearRegression
+from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import KNNImputer
 from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV
@@ -64,7 +65,7 @@ warnings.filterwarnings('ignore')
 # CONFIGURACIÓN
 # =============================================================================
 
-BASE_PATH       = r'E:\Academico\Universidad\Posgrado\Tesis\Datos\PORTABLES'
+from config import BASE_PATH
 DATA_TYPE       = 'ce'
 SPACE           = 'roi'
 GROUP1          = 'PSEN1'    # clase positiva
@@ -76,10 +77,16 @@ N_INNER_FOLDS   = 5
 N_ITER_SEARCH   = 50        # reducir para velocidad; 100+ para publicación
 
 # Feature selection
-N_FEATURES_KBEST   = 20
-N_FEATURES_RFE     = 20
-CORR_THRESHOLD     = 0.85   # pre-filtro (no usa y → sin leakage de etiquetas)
-VAR_THRESHOLD      = 0.01
+# k se determina dinámicamente por get_k_candidates() según N y features disponibles.
+# Regla: k ≤ N_train/10  (evita overfitting) y k ≤ n_features.
+# El inner CV elige el k óptimo dentro de estos candidatos.
+K_CANDIDATES   = [5, 10, 15, 20, 25, 30, 40, 50, 75, 100]  # valores a explorar
+
+# Ratio máximo features/muestras por tipo de clasificador
+# LR: regla EPV (N//10); SVM y RF toleran ratios más altos por su regularización interna
+# XGB: regularización propia (colsample_bytree, gamma, reg_alpha) → mismo ratio que SVM
+_K_MAX_RATIO = {'RF': 4, 'SVM': 6, 'LR': 10, 'XGB': 6}
+VAR_THRESHOLD  = 0.01    # pre-filtro varianza (sin usar y → sin leakage)
 
 # Balanceo de clases
 APPLY_SMOTE     = True
@@ -135,10 +142,24 @@ LR_PARAMS = {
     'max_iter':     [1000],
 }
 
+XGB_PARAMS = {
+    'n_estimators':     [100, 200, 300, 500],
+    'max_depth':        [3, 4, 5, 6],
+    'learning_rate':    [0.01, 0.05, 0.1, 0.2],
+    'subsample':        [0.6, 0.8, 1.0],
+    'colsample_bytree': [0.5, 0.7, 1.0],
+    'min_child_weight': [1, 3, 5],
+    'gamma':            [0, 0.1, 0.5],
+    'reg_alpha':        [0, 0.1, 1.0],
+    'scale_pos_weight': [1, 5, 10, 15],
+}
+
 CLASSIFIERS = [
     ('RF',  RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=1), RF_PARAMS),
-    ('SVM', SVC(probability=True, random_state=RANDOM_STATE),            SVM_PARAMS),
+    ('SVM', SVC(probability=True, random_state=RANDOM_STATE, max_iter=5000), SVM_PARAMS),
     ('LR',  LogisticRegression(random_state=RANDOM_STATE),               LR_PARAMS),
+    ('XGB', XGBClassifier(random_state=RANDOM_STATE, eval_metric='logloss',
+                          verbosity=0, n_jobs=1),                         XGB_PARAMS),
 ]
 
 # =============================================================================
@@ -167,23 +188,69 @@ def setup_logging(output_dir):
 # CARGA Y PREPARACIÓN DE DATOS
 # =============================================================================
 
-def load_and_prepare(filepath, group1, group2, logger, include_age=False):
+def load_and_prepare(filepath, group1, group2, logger, include_age=False,
+                     case_orig_labels=None, control_orig_labels=None,
+                     site_filter=None, case_site_exclude=None):
     """
     Carga feather, filtra a 2 grupos, agrega a nivel de sujeto (media).
 
-    include_age : si True, agrega 'age' como feature explícita del modelo
-                  (condición 'covariates_in_model').
-                  Si False (default), age se extrae solo para residualización.
+    include_age          : si True, agrega 'age' como feature explícita del modelo.
+    case_orig_labels     : lista de valores de 'orig_group' para el grupo caso.
+                           Si None, filtra por group == group1.
+    control_orig_labels  : lista de valores de 'orig_group' para el grupo control.
+                           Si None, filtra por group in g2_list.
+    site_filter          : str o lista — si se especifica, restringe a sujetos con
+                           SITE en ese valor/lista antes de cualquier otro filtro.
+    case_site_exclude    : str o lista — excluye sujetos CASO cuyo SITE esté en
+                           esa lista. Los controles NO se afectan.
 
     Retorna X, y, feature_names, subjects, ages, data_agg.
     """
     data = pd.read_feather(filepath)
 
-    # Filtrar grupos
-    g2_list = group2 if isinstance(group2, list) else [group2]
-    mask = data['group'].isin([group1] + g2_list)
-    data = data[mask].copy()
-    data['group'] = data['group'].apply(lambda x: g2_list[0] if x in g2_list else x)
+    # Filtro de SITE (aplicado antes del filtro de grupo)
+    if site_filter is not None and 'SITE' in data.columns:
+        sites = [site_filter] if isinstance(site_filter, str) else list(site_filter)
+        data = data[data['SITE'].isin(sites)].copy()
+        logger.info(f"  Filtro SITE={sites}: {data['subject'].nunique()} sujetos")
+
+    # Filtrar grupos: por orig_group si se especifica, si no por group mapeado
+    g2_list  = group2 if isinstance(group2, list) else [group2]
+    has_orig = 'orig_group' in data.columns
+
+    needs_orig = case_orig_labels is not None or control_orig_labels is not None
+    if needs_orig and not has_orig:
+        raise ValueError(
+            f"El experimento requiere filtrar por 'orig_group' "
+            f"(case_orig_labels={case_orig_labels}), pero la columna 'orig_group' "
+            f"no existe en el feather '{os.path.basename(filepath)}'.\n"
+            f"Solucion: re-ejecutar 1_make_dataframe.py y luego "
+            f"optional_neuroharmonize.py para regenerar el feather con orig_group."
+        )
+
+    if needs_orig:
+        is_case = (data['orig_group'].isin(case_orig_labels)
+                   if case_orig_labels is not None
+                   else data['group'] == group1)
+        is_ctrl = (data['orig_group'].isin(control_orig_labels)
+                   if control_orig_labels is not None
+                   else data['group'].isin(g2_list))
+        if case_site_exclude is not None and 'SITE' in data.columns:
+            excl = [case_site_exclude] if isinstance(case_site_exclude, str) else list(case_site_exclude)
+            is_case = is_case & ~data['SITE'].isin(excl)
+            logger.info(f"  case_site_exclude={excl}: portadores de esos sitios excluidos")
+        combined = is_case | is_ctrl
+        data = data[combined].copy()
+        data['group'] = np.where(is_case[combined].values, group1, g2_list[0])
+    else:
+        mask = data['group'].isin([group1] + g2_list)
+        data = data[mask].copy()
+        data['group'] = data['group'].apply(lambda x: g2_list[0] if x in g2_list else x)
+        if case_site_exclude is not None and 'SITE' in data.columns:
+            excl = [case_site_exclude] if isinstance(case_site_exclude, str) else list(case_site_exclude)
+            drop = (data['group'] == group1) & data['SITE'].isin(excl)
+            data = data[~drop].copy()
+            logger.info(f"  case_site_exclude={excl}: portadores de esos sitios excluidos")
 
     logger.info(f"  Rows cargados: {len(data)} | Sujetos únicos: {data['subject'].nunique()}")
     logger.info(f"  Distribución: {data.groupby('group')['subject'].nunique().to_dict()}")
@@ -192,8 +259,9 @@ def load_and_prepare(filepath, group1, group2, logger, include_age=False):
     # Columnas de features (excluir siempre las meta-columnas)
     # age se excluye aquí y se añade explícitamente solo si include_age=True
     exclude = set(EXCLUDE_COLS) | {'subject', 'group', 'SITE', 'sex', 'age',
-                                    'education', 'ses', 'mmse', 'moca'}
-    feature_cols = [c for c in data.columns if c not in exclude]
+                                    'education', 'ses', 'mmse', 'moca', 'orig_group'}
+    feature_cols = [c for c in data.columns
+                    if c not in exclude and pd.api.types.is_numeric_dtype(data[c])]
 
     # Agregar a nivel sujeto (media de todas las filas del sujeto)
     data_feat = data.groupby('subject')[feature_cols].mean().reset_index()
@@ -247,34 +315,31 @@ def load_and_prepare(filepath, group1, group2, logger, include_age=False):
 
 def prefilter_features(X, feature_names, logger):
     """
-    1. Elimina features con varianza casi cero.
-    2. Elimina features altamente correlacionadas (r > CORR_THRESHOLD).
-    Nota: se aplica sobre TODOS los datos (no usa y → no introduce sesgo de etiqueta).
+    Elimina features con varianza casi cero (VAR_THRESHOLD).
+    El filtro de correlación se elimina: SelectKBest/RFE dentro del CV
+    manejan la redundancia y k se optimiza como hiperparámetro.
     """
     n_orig = X.shape[1]
-
-    # Paso 1: varianza
     vt = VarianceThreshold(threshold=VAR_THRESHOLD)
     try:
-        X_vt = vt.fit_transform(np.nan_to_num(X, nan=0.0))
-        feat_vt = np.array(feature_names)[vt.get_support()]
+        X_out  = vt.fit_transform(np.nan_to_num(X, nan=0.0))
+        f_out  = np.array(feature_names)[vt.get_support()].tolist()
     except Exception:
-        X_vt, feat_vt = X, np.array(feature_names)
+        X_out, f_out = X, list(feature_names)
+    logger.info(f"  Pre-filtro varianza: {n_orig} → {len(f_out)} features")
+    return X_out, f_out
 
-    # Paso 2: correlación
-    df_tmp = pd.DataFrame(X_vt, columns=feat_vt)
-    df_tmp = df_tmp.fillna(df_tmp.median())
 
-    # Correlación por bloques para eficiencia con muchas features
-    corr = df_tmp.corr().abs()
-    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-    to_drop = set(col for col in upper.columns if any(upper[col] > CORR_THRESHOLD))
-
-    feat_final = [f for f in feat_vt if f not in to_drop]
-    X_final = df_tmp[feat_final].values
-
-    logger.info(f"  Pre-filtro: {n_orig} → {len(feat_vt)} (var) → {len(feat_final)} (corr r>{CORR_THRESHOLD})")
-    return X_final, list(feat_final)
+def get_k_candidates(n_samples, n_features_avail, clf_name='LR'):
+    """
+    Candidatos de k para SelectKBest/RFE, con cap específico por clasificador.
+    LR: N//10 (regla EPV para regresión logística).
+    SVM: N//6 (kernel SVM tolera más features por regularización implícita).
+    RF: N//4 (árboles de decisión toleran ratios feature/muestra altos).
+    """
+    ratio = _K_MAX_RATIO.get(clf_name, 10)
+    max_k = min(n_features_avail, max(5, n_samples // ratio))
+    return [k for k in K_CANDIDATES if k <= max_k] or [5]
 
 
 # =============================================================================
@@ -322,39 +387,115 @@ def compute_metrics(y_true, y_pred, y_proba):
 # NESTED CROSS-VALIDATION (NÚCLEO PRINCIPAL)
 # =============================================================================
 
+def _apply_smote_to_train(X_tr, y_tr, random_state=RANDOM_STATE):
+    """SMOTE + undersampling sobre train. Retorna (X_bal, y_bal)."""
+    counts = np.bincount(y_tr)
+    ratio  = counts.min() / counts.max() if counts.max() > 0 else 1.0
+    if ratio >= 0.8:
+        return X_tr, y_tr
+    k_nb = min(5, int(counts.min()) - 1)
+    if k_nb < 1:
+        return X_tr, y_tr
+    try:
+        sm  = SMOTE(sampling_strategy=SMOTE_RATIO, random_state=random_state, k_neighbors=k_nb)
+        rus = RandomUnderSampler(sampling_strategy=1.0, random_state=random_state)
+        X_s, y_s = sm.fit_resample(X_tr, y_tr)
+        X_s, y_s = rus.fit_resample(X_s, y_s)
+        return X_s, y_s
+    except Exception:
+        return X_tr, y_tr
+
+
+def _build_covariate_matrix(ages, sexes, idx, apply_resid, apply_sex_resid):
+    """Construye la matriz de covariables para residualización dentro de un fold."""
+    cols = []
+    if apply_resid and ages is not None:
+        cols.append(ages[idx].reshape(-1, 1))
+    if apply_sex_resid and sexes is not None:
+        cols.append(sexes[idx].reshape(-1, 1))
+    return np.hstack(cols) if cols else None
+
+
+def _preprocess_fold(X_tr_raw, X_te_raw, y_tr, ages, train_idx, test_idx,
+                     apply_resid, apply_smote, sexes=None, apply_sex_resid=False):
+    """
+    Aplica la cadena completa de preprocesamiento dentro de un fold sin data leakage:
+      KNNImputer → [residualización edad/sexo] → StandardScaler → [SMOTE]
+
+    Retorna (X_tr_proc, y_tr_proc, X_te_proc)
+    donde X_te_proc NO tiene SMOTE (solo impute+resid+scale).
+    """
+    # 1. Imputation
+    imp = KNNImputer(n_neighbors=min(5, len(train_idx) - 1))
+    X_tr = imp.fit_transform(X_tr_raw)
+    X_te = imp.transform(X_te_raw)
+
+    # 2. Residualización de covariables (edad y/o sexo)
+    cov_tr = _build_covariate_matrix(ages, sexes, train_idx, apply_resid, apply_sex_resid)
+    cov_te = _build_covariate_matrix(ages, sexes, test_idx,  apply_resid, apply_sex_resid)
+    if cov_tr is not None:
+        X_tr, X_te = residualize_covariates(X_tr, X_te, cov_tr, cov_te)
+
+    # 3. Escalado
+    sc = StandardScaler()
+    X_tr = sc.fit_transform(X_tr)
+    X_te = sc.transform(X_te)
+
+    # 4. SMOTE (solo en train)
+    if apply_smote:
+        X_tr, y_tr = _apply_smote_to_train(X_tr, y_tr)
+
+    return X_tr, y_tr, X_te
+
+
+def _build_selector_pipeline(clf_base, fs_name, n_features_avail):
+    """Construye Pipeline(selector, clf) y su grid con k como hiperparámetro."""
+    from sklearn.pipeline import Pipeline as SkPipeline
+    if fs_name == 'kbest':
+        selector  = SelectKBest(f_classif)
+        fs_key    = 'selector__k'
+        step_name = 'selector'
+    else:
+        rfe_est  = RandomForestClassifier(n_estimators=30, max_depth=5,
+                                          n_jobs=1, random_state=RANDOM_STATE)
+        step_size = max(1, n_features_avail // 8)
+        selector  = RFE(rfe_est, step=step_size)
+        fs_key    = 'selector__n_features_to_select'
+        step_name = 'selector'
+
+    pipe = SkPipeline([(step_name, selector), ('clf', clone(clf_base))])
+    return pipe, fs_key
+
+
 def run_nested_cv(X, y, feature_names, ages, logger,
                   n_outer=10, n_inner=5, n_iter=50,
-                  apply_smote=True, apply_resid=False):
+                  apply_smote=True, apply_resid=False,
+                  sexes=None, apply_sex_resid=False):
     """
-    Nested CV:
-      - Outer loop (n_outer folds estratificados): estima rendimiento sin sesgo
-      - Inner loop (n_inner folds, RandomizedSearchCV): ajusta hiperparámetros
+    Nested CV con k (número de features) como hiperparámetro del inner CV.
 
-    Preprocessing dentro de cada fold (sin data leakage):
-      KNNImputer → [residualización] → StandardScaler → [SMOTE] → feature selection
+      Outer loop  : n_outer folds estratificados → estimación sin sesgo
+      Inner loop  : RandomizedSearchCV sobre [clf params + k] → selección óptima
 
-    Combos evaluados: 3 clasificadores × 2 métodos de feature selection = 6 combos
+    Preprocesamiento dentro de cada fold (sin data leakage):
+      KNNImputer → [residualización edad] → StandardScaler → [SMOTE]
+      → Pipeline(SelectKBest/RFE, Classifier) optimizado por inner CV
 
-    Retorna:
-      summary         : dict {combo_name: {auc_mean, f1_mean, ...}}
-      y_true_all      : etiquetas reales concatenadas de todos los folds
-      stable_features : dict {método: [feature_names con mayoría de votos]}
-      feature_votes   : dict {método: array de conteos por feature}
+    k se elige adaptativamente: candidatos en K_CANDIDATES ∩ [5, N_train/10].
+
+    Retorna summary, y_true_all, stable_features, feature_votes.
     """
-    n_splits = min(n_outer, int(np.bincount(y).min()))
-    n_splits = max(n_splits, 3)  # mínimo 3 folds
-
+    n_splits = max(3, min(n_outer, int(np.bincount(y).min())))
     if n_splits < n_outer:
-        logger.warning(f"  Clase minoritaria = {np.bincount(y).min()} sujetos → {n_splits} folds")
+        logger.warning(f"  Clase minoritaria = {np.bincount(y).min()} → {n_splits} folds")
 
-    outer_cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
-
+    outer_cv    = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
     combo_names = [f"{clf}_{fs}" for clf, _, _ in CLASSIFIERS for fs in ['kbest', 'rfe']]
-    all_results  = {k: [] for k in combo_names}
-    all_cm       = {k: np.zeros((2, 2), dtype=int) for k in combo_names}
-    all_y_proba  = {k: [] for k in combo_names}
-    y_true_all   = []
-
+    combo_names += ['ENS_soft']
+    all_results = {k: [] for k in combo_names}
+    all_cm      = {k: np.zeros((2, 2), dtype=int) for k in combo_names}
+    all_y_proba = {k: [] for k in combo_names}
+    y_true_all  = []
     feature_votes = {
         'kbest': np.zeros(X.shape[1], dtype=int),
         'rfe':   np.zeros(X.shape[1], dtype=int),
@@ -364,105 +505,80 @@ def run_nested_cv(X, y, feature_names, ages, logger,
 
     for fold_idx, (train_idx, test_idx) in enumerate(outer_cv.split(X, y)):
         t0 = time.time()
-        X_tr, X_te = X[train_idx].copy(), X[test_idx].copy()
-        y_tr, y_te = y[train_idx], y[test_idx]
+        X_tr_raw = X[train_idx].copy()
+        X_te_raw = X[test_idx].copy()
+        y_tr     = y[train_idx]
+        y_te     = y[test_idx]
 
-        # 1. KNN Imputation (ajustado en train, aplicado en test)
-        imputer = KNNImputer(n_neighbors=min(5, len(train_idx) - 1))
-        X_tr = imputer.fit_transform(X_tr)
-        X_te = imputer.transform(X_te)
+        X_tr, y_tr_proc, X_te = _preprocess_fold(
+            X_tr_raw, X_te_raw, y_tr, ages, train_idx, test_idx,
+            apply_resid, apply_smote, sexes=sexes, apply_sex_resid=apply_sex_resid,
+        )
 
-        # 2. Residualización (opcional)
-        if apply_resid and ages is not None:
-            cov_tr = ages[train_idx].reshape(-1, 1)
-            cov_te = ages[test_idx].reshape(-1, 1)
-            X_tr, X_te = residualize_covariates(X_tr, X_te, cov_tr, cov_te)
+        inner_cv = StratifiedKFold(
+            n_splits=min(n_inner, int(np.bincount(y_tr_proc).min())),
+            shuffle=True, random_state=RANDOM_STATE,
+        )
 
-        # 3. Estandarización (ajustada en train)
-        scaler = StandardScaler()
-        X_tr = scaler.fit_transform(X_tr)
-        X_te = scaler.transform(X_te)
-
-        # 4. SMOTE + undersampling (solo sobre datos de entrenamiento)
-        X_tr_sm, y_tr_sm = X_tr.copy(), y_tr.copy()
-        if apply_smote:
-            counts = np.bincount(y_tr)
-            ratio  = counts.min() / counts.max() if counts.max() > 0 else 1.0
-            if ratio < 0.8:
-                k_nb = min(5, counts.min() - 1)
-                if k_nb >= 1:
-                    try:
-                        smote = SMOTE(sampling_strategy=SMOTE_RATIO,
-                                      random_state=RANDOM_STATE, k_neighbors=k_nb)
-                        rus   = RandomUnderSampler(sampling_strategy=1.0,
-                                                   random_state=RANDOM_STATE)
-                        X_tr_sm, y_tr_sm = smote.fit_resample(X_tr, y_tr)
-                        X_tr_sm, y_tr_sm = rus.fit_resample(X_tr_sm, y_tr_sm)
-                    except Exception as e:
-                        logger.debug(f"    SMOTE fold {fold_idx+1} falló: {e}")
-
-        # 5. Feature selection (sobre datos balanceados)
-        n_kbest = min(N_FEATURES_KBEST, max(2, X_tr_sm.shape[1] // 4))
-        n_rfe   = min(N_FEATURES_RFE,   max(2, X_tr_sm.shape[1] // 4))
-
-        # SelectKBest
-        kb = SelectKBest(f_classif, k=n_kbest)
-        kb.fit(X_tr_sm, y_tr_sm)
-        kbest_idx = kb.get_support(indices=True)
-        feature_votes['kbest'][kbest_idx] += 1
-
-        # RFE con RF ligero
-        rfe_base = RandomForestClassifier(n_estimators=30, max_depth=5,
-                                           n_jobs=-1, random_state=RANDOM_STATE)
-        step = max(1, X_tr_sm.shape[1] // 8)
-        rfe = RFE(rfe_base, n_features_to_select=n_rfe, step=step)
-        rfe.fit(X_tr_sm, y_tr_sm)
-        rfe_idx = np.where(rfe.support_)[0]
-        feature_votes['rfe'][rfe_idx] += 1
-
-        feature_sets = {'kbest': kbest_idx, 'rfe': rfe_idx}
         y_true_all.extend(y_te.tolist())
+        fold_probas = {}   # acumula y_proba por combo para el ensemble
 
-        # 6. Inner CV: ajuste de hiperparámetros + evaluación
-        inner_cv = StratifiedKFold(n_splits=min(n_inner, int(np.bincount(y_tr_sm).min())),
-                                   shuffle=True, random_state=RANDOM_STATE)
-
-        for clf_name, clf_base, param_grid in CLASSIFIERS:
-            for fs_name, feat_idx in feature_sets.items():
-                key = f"{clf_name}_{fs_name}"
-                X_tr_fs = X_tr_sm[:, feat_idx]
-                X_te_fs = X_te[:, feat_idx]
+        for clf_name, clf_base, clf_params in CLASSIFIERS:
+            # k candidates específicos por clasificador
+            k_cands = get_k_candidates(len(y_tr_proc), X_tr.shape[1], clf_name)
+            for fs_name in ['kbest', 'rfe']:
+                key  = f"{clf_name}_{fs_name}"
+                pipe, fs_key = _build_selector_pipeline(clf_base, fs_name, X_tr.shape[1])
+                grid = {f'clf__{p}': v for p, v in clf_params.items()}
+                grid[fs_key] = k_cands
 
                 try:
                     search = RandomizedSearchCV(
-                        clf_base, param_grid,
-                        n_iter=n_iter,
-                        cv=inner_cv,
-                        scoring='roc_auc',
-                        n_jobs=-1,
-                        random_state=RANDOM_STATE,
-                        error_score=0.5,
-                        refit=True,
+                        pipe, grid,
+                        n_iter=n_iter, cv=inner_cv,
+                        scoring='roc_auc', n_jobs=1,
+                        random_state=RANDOM_STATE, error_score=0.5, refit=True,
                     )
-                    search.fit(X_tr_fs, y_tr_sm)
-                    best_clf = search.best_estimator_
+                    search.fit(X_tr, y_tr_proc)
 
-                    y_pred  = best_clf.predict(X_te_fs)
-                    y_proba = best_clf.predict_proba(X_te_fs)[:, 1]
+                    # Registrar features seleccionadas por el mejor modelo
+                    sel = search.best_estimator_.named_steps['selector']
+                    feat_idx = (sel.get_support(indices=True)
+                                if fs_name == 'kbest'
+                                else np.where(sel.support_)[0])
+                    feature_votes[fs_name][feat_idx] += 1
+
+                    y_pred  = search.predict(X_te)
+                    y_proba = search.predict_proba(X_te)[:, 1]
+                    fold_probas[key] = (y_proba, search.best_score_)
 
                     m = compute_metrics(y_te, y_pred, y_proba)
                     all_results[key].append(m)
-                    all_cm[key] += m['cm']
+                    all_cm[key]     += m['cm']
                     all_y_proba[key].extend(y_proba.tolist())
 
                 except Exception as e:
                     logger.debug(f"    {key} fold {fold_idx+1} error: {e}")
 
+        # Ensemble suave: promedio ponderado por AUC del inner CV
+        if len(fold_probas) >= 2:
+            try:
+                total_w  = sum(w for _, w in fold_probas.values())
+                ens_prob = sum(p * (w / total_w)
+                               for p, w in fold_probas.values())
+                ens_pred = (ens_prob >= 0.5).astype(int)
+                m_ens    = compute_metrics(y_te, ens_pred, ens_prob)
+                all_results['ENS_soft'].append(m_ens)
+                all_cm['ENS_soft']     += m_ens['cm']
+                all_y_proba['ENS_soft'].extend(ens_prob.tolist())
+            except Exception as e:
+                logger.debug(f"    ENS_soft fold {fold_idx+1} error: {e}")
+
         elapsed = time.time() - t0
         logger.info(f"  Fold {fold_idx+1}/{n_splits} completado ({elapsed:.1f}s) | "
                     f"Test n={len(y_te)} | pos={y_te.sum()}")
 
-    # Agregar resultados por fold → media ± desv. estándar
+    # Agregar por fold
     summary = {}
     for key, fold_metrics in all_results.items():
         if not fold_metrics:
@@ -474,14 +590,13 @@ def run_nested_cv(X, y, feature_names, ages, logger,
             if vals:
                 agg[f'{metric}_mean'] = float(np.mean(vals))
                 agg[f'{metric}_std']  = float(np.std(vals))
-        agg['n_folds']      = len(fold_metrics)
-        agg['cm']           = all_cm[key]
-        agg['y_proba_all']  = np.array(all_y_proba[key])
+        agg['n_folds']     = len(fold_metrics)
+        agg['cm']          = all_cm[key]
+        agg['y_proba_all'] = np.array(all_y_proba[key])
         summary[key] = agg
 
-    # Voto mayoritario de features: feature aparece en >= 50% de los folds
-    majority_thr = n_splits // 2
-    feat_arr = np.array(feature_names)
+    majority_thr    = n_splits // 2
+    feat_arr        = np.array(feature_names)
     stable_features = {
         'kbest': feat_arr[feature_votes['kbest'] >= majority_thr].tolist(),
         'rfe':   feat_arr[feature_votes['rfe']   >= majority_thr].tolist(),
@@ -494,18 +609,19 @@ def run_nested_cv(X, y, feature_names, ages, logger,
 # ANÁLISIS DE BOOTSTRAP (estabilidad de predicciones)
 # =============================================================================
 
-def bootstrap_stability(X, y, feature_names, best_combo_name, n_bootstrap=20, logger=None):
+def bootstrap_stability(X, y, feature_names, ages, best_combo_name, n_bootstrap=20,
+                        apply_smote=False, apply_resid=False, logger=None,
+                        sexes=None, apply_sex_resid=False):
     """
-    Reentrena el modelo best_combo sobre N_BOOTSTRAP remuestras bootstrap.
-    Reporta: AUC media ± std, y estabilidad de predicción.
+    Estabilidad bootstrap: reentrena el pipeline completo (preprocessing + selector +
+    clasificador) sobre N_BOOTSTRAP remuestras OOB. k se optimiza en cada resample
+    igual que en el CV, garantizando consistencia metodológica.
     """
     clf_name, fs_name = best_combo_name.split('_', 1)
-    clf_base = None
-    param_grid = None
+    clf_base = param_grid = None
     for name, clf, params in CLASSIFIERS:
         if name == clf_name:
-            clf_base = clf
-            param_grid = params
+            clf_base, param_grid = clf, params
             break
 
     auc_vals = []
@@ -515,48 +631,54 @@ def bootstrap_stability(X, y, feature_names, best_combo_name, n_bootstrap=20, lo
         idx_boot = rng.choice(len(y), size=len(y), replace=True)
         oob_mask = np.ones(len(y), dtype=bool)
         oob_mask[idx_boot] = False
-        oob_idx = np.where(oob_mask)[0]
+        oob_idx  = np.where(oob_mask)[0]
 
         if len(oob_idx) < 4 or len(np.unique(y[oob_idx])) < 2:
             continue
 
-        X_boot, y_boot = X[idx_boot], y[idx_boot]
-        X_oob,  y_oob  = X[oob_idx],  y[oob_idx]
+        X_boot, y_boot = X[idx_boot].copy(), y[idx_boot].copy()
+        X_oob,  y_oob  = X[oob_idx].copy(),  y[oob_idx]
 
-        # Impute + scale
-        imp = KNNImputer(n_neighbors=5)
+        # Preprocessing (fit en boot, apply en oob)
+        imp = KNNImputer(n_neighbors=min(5, len(idx_boot) - 1))
         X_boot = imp.fit_transform(X_boot)
         X_oob  = imp.transform(X_oob)
+
+        cov_boot = _build_covariate_matrix(ages, sexes, idx_boot, apply_resid, apply_sex_resid)
+        cov_oob  = _build_covariate_matrix(ages, sexes, oob_idx,  apply_resid, apply_sex_resid)
+        if cov_boot is not None:
+            X_boot, X_oob = residualize_covariates(X_boot, X_oob, cov_boot, cov_oob)
+
         sc = StandardScaler()
         X_boot = sc.fit_transform(X_boot)
         X_oob  = sc.transform(X_oob)
 
-        # Feature selection
-        n_feat = min(N_FEATURES_KBEST, X_boot.shape[1] // 4)
-        if fs_name == 'kbest':
-            fs = SelectKBest(f_classif, k=n_feat)
-            X_boot_fs = fs.fit_transform(X_boot, y_boot)
-            X_oob_fs  = fs.transform(X_oob)
-        else:
-            rfe_b = RandomForestClassifier(n_estimators=30, max_depth=5, random_state=b)
-            fs = RFE(rfe_b, n_features_to_select=n_feat, step=max(1, n_feat))
-            X_boot_fs = fs.fit_transform(X_boot, y_boot)
-            X_oob_fs  = fs.transform(X_oob)
+        if apply_smote:
+            X_boot, y_boot = _apply_smote_to_train(X_boot, y_boot, random_state=b)
+
+        # Pipeline selector + clf con k como hiperparámetro
+        k_cands   = get_k_candidates(len(y_boot), X_boot.shape[1], clf_name)
+        pipe, fs_key = _build_selector_pipeline(clf_base, fs_name, X_boot.shape[1])
+        grid = {f'clf__{p}': v for p, v in param_grid.items()}
+        grid[fs_key] = k_cands
 
         try:
-            inner = StratifiedKFold(n_splits=3, shuffle=True, random_state=b)
-            s = RandomizedSearchCV(clf_base, param_grid, n_iter=20, cv=inner,
-                                   scoring='roc_auc', n_jobs=-1,
+            inner = StratifiedKFold(
+                n_splits=min(3, int(np.bincount(y_boot).min())),
+                shuffle=True, random_state=b,
+            )
+            s = RandomizedSearchCV(pipe, grid, n_iter=20, cv=inner,
+                                   scoring='roc_auc', n_jobs=1,
                                    random_state=b, error_score=0.5)
-            s.fit(X_boot_fs, y_boot)
-            proba = s.predict_proba(X_oob_fs)[:, 1]
+            s.fit(X_boot, y_boot)
+            proba = s.predict_proba(X_oob)[:, 1]
             auc_vals.append(roc_auc_score(y_oob, proba))
         except Exception:
             pass
 
     result = {
-        'auc_mean':   float(np.mean(auc_vals)) if auc_vals else np.nan,
-        'auc_std':    float(np.std(auc_vals))  if auc_vals else np.nan,
+        'auc_mean':    float(np.mean(auc_vals)) if auc_vals else np.nan,
+        'auc_std':     float(np.std(auc_vals))  if auc_vals else np.nan,
         'n_resamples': len(auc_vals),
     }
     if logger:
@@ -587,12 +709,12 @@ def shap_analysis(final_model, X_fs, feature_names_fs, clf_name,
         return None
 
     try:
-        if clf_name == 'RF':
+        if clf_name in ('RF', 'XGB'):
             explainer = shap.TreeExplainer(final_model)
             shap_values = explainer.shap_values(X_fs)
-            # RF binario: puede ser lista [clase0, clase1] o array 3D (n_samples, n_features, n_classes)
+            # RF/XGB binario: puede ser lista [clase0, clase1] o array 3D
             if isinstance(shap_values, list) and len(shap_values) == 2:
-                sv = shap_values[1]          # clase positiva (PSEN1)
+                sv = shap_values[1]          # clase positiva
             elif isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
                 sv = shap_values[:, :, 1]    # clase positiva
             else:
@@ -687,19 +809,29 @@ def sage_analysis(final_model, X_fs, y, feature_names_fs,
         return None
 
     try:
-        # Subsample para eficiencia (detect_convergence controla precisión)
-        n_bg = min(512, len(X_fs))
+        # Subsample para eficiencia: máximo 256 sujetos de fondo
+        # detect_convergence=True puede no terminar nunca con datos EEG ruidosos;
+        # n_permutations fijo garantiza tiempo de ejecución acotado.
+        n_bg = min(256, len(X_fs))
+        N_SAGE_PERMUTATIONS = 512   # ~2-10 min según modelo; aumentar para publicación
         rng = np.random.default_rng(RANDOM_STATE)
         bg_idx = rng.choice(len(X_fs), size=n_bg, replace=False)
         X_bg = X_fs[bg_idx]
         y_bg = np.asarray(y)[bg_idx]
+        # Workaround: SAGE library accesses index n_bg (off-by-one bug).
+        # Añadir una fila duplicada hace que ese acceso sea válido.
+        X_bg_s = np.vstack([X_bg, X_bg[-1:]])
+        y_bg_s = np.append(y_bg, y_bg[-1])
 
         if logger:
-            logger.info(f"  SAGE iniciando ({clf_name}, n={n_bg}, loss=cross_entropy)...")
+            logger.info(f"  SAGE iniciando ({clf_name}, n={n_bg}, "
+                        f"permutations={N_SAGE_PERMUTATIONS}, loss=cross_entropy)...")
 
-        imputer   = sage.MarginalImputer(final_model, X_bg)
+        imputer   = sage.MarginalImputer(final_model, X_bg_s)
         estimator = sage.PermutationEstimator(imputer, 'cross entropy')
-        sage_values = estimator(X_bg, y_bg, detect_convergence=True,
+        sage_values = estimator(X_bg_s, y_bg_s,
+                                detect_convergence=False,
+                                n_permutations=N_SAGE_PERMUTATIONS,
                                 verbose=False, bar=False)
 
         vals = np.array(sage_values.values)   # (n_features,)
@@ -861,7 +993,8 @@ def feature_noise_robustness(X, y, best_combo_name,
             X_tr = sc.fit_transform(X_tr)
             X_te = sc.transform(X_te)
 
-            n_feat = min(N_FEATURES_KBEST, max(2, X_tr.shape[1] // 4))
+            k_opts = get_k_candidates(len(X_tr), X_tr.shape[1], clf_name)
+            n_feat = k_opts[-1] if k_opts else 5
             if fs_name == 'kbest':
                 fs = SelectKBest(f_classif, k=n_feat)
                 X_tr_fs = fs.fit_transform(X_tr, y_tr)
@@ -906,7 +1039,8 @@ def feature_noise_robustness(X, y, best_combo_name,
         ax.set_xlabel('Nivel de ruido (% std feature)')
         ax.set_ylabel('AUC-ROC')
         ax.set_title('Robustez: Ruido en features (multisite)', fontsize=10)
-        ax.set_ylim(max(0, min(v for v in auc_by_level if not np.isnan(v)) - 0.1), 1.02)
+        valid_v = [v for v in auc_by_level if not np.isnan(v)]
+        ax.set_ylim(max(0, (min(valid_v) - 0.1) if valid_v else 0), 1.02)
         ax.legend()
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'robustness_noise.png'), dpi=200)
@@ -961,7 +1095,8 @@ def hyperparameter_sensitivity(X, y, best_combo_name, best_params=None,
             X_tr = sc.fit_transform(X_tr)
             X_te = sc.transform(X_te)
 
-            n_feat = min(N_FEATURES_KBEST, max(2, X_tr.shape[1] // 4))
+            k_opts = get_k_candidates(len(X_tr), X_tr.shape[1], clf_name)
+            n_feat = k_opts[-1] if k_opts else 5
             if fs_name == 'kbest':
                 fs = SelectKBest(f_classif, k=n_feat)
                 X_tr_fs = fs.fit_transform(X_tr, y_tr)
@@ -1028,79 +1163,87 @@ def hyperparameter_sensitivity(X, y, best_combo_name, best_params=None,
 # ENTRENAMIENTO DE MODELO FINAL (sobre TODOS los datos)
 # =============================================================================
 
-def train_final_model(X, y, feature_names, best_combo_name, output_dir, logger):
+def train_final_model(X, y, feature_names, best_combo_name, output_dir, logger,
+                      group1=None, group2=None, ages=None, apply_resid=False,
+                      apply_smote=False, sexes=None, apply_sex_resid=False):
     """
-    Entrena el modelo final sobre todos los datos con la mejor configuración.
-    Guarda: modelo .pkl, scaler, imputer, metadata.
+    Entrena el modelo final sobre TODOS los datos.
+    Replica el mismo pipeline del CV: impute → resid → scale → SMOTE →
+    Pipeline(selector, clf) con k optimizado por inner CV.
     """
+    group1 = group1 or GROUP1
+    group2 = group2 or GROUP2
     clf_name, fs_name = best_combo_name.split('_', 1)
-    clf_base   = None
-    param_grid = None
+    clf_base = param_grid = None
     for name, clf, params in CLASSIFIERS:
         if name == clf_name:
-            clf_base   = clf
-            param_grid = params
+            clf_base, param_grid = clf, params
             break
 
-    # Preprocessing completo sobre todos los datos
-    imputer = KNNImputer(n_neighbors=5)
-    X_imp = imputer.fit_transform(X)
-    scaler = StandardScaler()
-    X_sc  = scaler.fit_transform(X_imp)
+    # Preprocessing sobre todos los datos (sin leakage: no hay test aquí)
+    imp = KNNImputer(n_neighbors=5)
+    X_p = imp.fit_transform(X)
 
-    # Feature selection
-    n_feat = min(N_FEATURES_KBEST, max(2, X_sc.shape[1] // 4))
-    if fs_name == 'kbest':
-        fs = SelectKBest(f_classif, k=n_feat)
-        X_fs = fs.fit_transform(X_sc, y)
-        selected_idx = fs.get_support(indices=True)
-    else:
-        rfe_base = RandomForestClassifier(n_estimators=50, max_depth=5,
-                                           n_jobs=-1, random_state=RANDOM_STATE)
-        step = max(1, X_sc.shape[1] // 8)
-        fs = RFE(rfe_base, n_features_to_select=n_feat, step=step)
-        X_fs = fs.fit_transform(X_sc, y)
-        selected_idx = np.where(fs.support_)[0]
+    all_idx = np.arange(len(y))
+    cov_all = _build_covariate_matrix(ages, sexes, all_idx, apply_resid, apply_sex_resid)
+    if cov_all is not None:
+        dummy = np.zeros_like(X_p)
+        X_p, _ = residualize_covariates(X_p, dummy, cov_all, cov_all)
 
+    sc  = StandardScaler()
+    X_p = sc.fit_transform(X_p)
+
+    y_p = y.copy()
+    if apply_smote:
+        X_p, y_p = _apply_smote_to_train(X_p, y_p)
+
+    # Pipeline selector + clf con k como hiperparámetro
+    k_cands   = get_k_candidates(len(y_p), X_p.shape[1], clf_name)
+    pipe, fs_key = _build_selector_pipeline(clf_base, fs_name, X_p.shape[1])
+    grid = {f'clf__{p}': v for p, v in param_grid.items()}
+    grid[fs_key] = k_cands
+
+    _min_class    = int(np.bincount(y_p).min())
+    _n_cv_final   = max(2, min(5, _min_class))
+    inner_cv      = StratifiedKFold(n_splits=_n_cv_final, shuffle=True, random_state=RANDOM_STATE)
+    search        = RandomizedSearchCV(
+        pipe, grid, n_iter=N_ITER_SEARCH, cv=inner_cv,
+        scoring='roc_auc', n_jobs=1, random_state=RANDOM_STATE,
+    )
+    search.fit(X_p, y_p)
+
+    best_pipe    = search.best_estimator_
+    sel          = best_pipe.named_steps['selector']
+    selected_idx = (sel.get_support(indices=True)
+                    if fs_name == 'kbest' else np.where(sel.support_)[0])
     selected_features = [feature_names[i] for i in selected_idx]
 
-    # Búsqueda final de hiperparámetros
-    # n_splits adaptativo: datasets pequeños (sensitivity) pueden tener < 5 muestras por clase
-    _min_class = int(np.bincount(y).min())
-    _n_splits_final = max(2, min(5, _min_class))
-    inner_cv = StratifiedKFold(n_splits=_n_splits_final, shuffle=True, random_state=RANDOM_STATE)
-    search = RandomizedSearchCV(
-        clf_base, param_grid,
-        n_iter=N_ITER_SEARCH,
-        cv=inner_cv,
-        scoring='roc_auc',
-        n_jobs=-1,
-        random_state=RANDOM_STATE,
-    )
-    search.fit(X_fs, y)
-    final_model = search.best_estimator_
+    # X en espacio de features seleccionadas (para SAGE/SHAP)
+    X_fs = best_pipe.named_steps['selector'].transform(X_p)
 
-    # Guardar
+    # Guardar artefactos
     model_info = {
-        'model':             final_model,
-        'imputer':           imputer,
-        'scaler':            scaler,
-        'feature_selector':  fs,
+        'model':             best_pipe.named_steps['clf'],
+        'pipeline':          best_pipe,
+        'imputer':           imp,
+        'scaler':            sc,
+        'feature_selector':  sel,
         'feature_names':     selected_features,
         'all_feature_names': feature_names,
         'classifier_name':   clf_name,
         'feature_selection': fs_name,
         'best_params':       search.best_params_,
-        'group_mapping':     {GROUP2: 0, GROUP1: 1},
-        'class_names':       [GROUP2, GROUP1],
+        'group_mapping':     {group2: 0, group1: 1},
+        'class_names':       [group2, group1],
         'n_features_used':   len(selected_features),
         'n_subjects_train':  len(y),
-        'pos_class':         GROUP1,
+        'pos_class':         group1,
     }
     joblib.dump(model_info, os.path.join(output_dir, 'final_model.pkl'))
-    logger.info(f"  Modelo final guardado: {clf_name} | {fs_name} | {len(selected_features)} features")
+    logger.info(f"  Modelo final guardado: {clf_name} | {fs_name} | "
+                f"{len(selected_features)} features (k_opt={len(selected_features)})")
 
-    return final_model, X_fs, selected_features, search.best_params_
+    return best_pipe.named_steps['clf'], X_fs, selected_features, search.best_params_
 
 
 # =============================================================================
@@ -1231,29 +1374,68 @@ def save_comparison_table(all_condition_results, output_path):
 
 
 # =============================================================================
+# FILTRADO POR FAMILIA DE FEATURES
+# =============================================================================
+
+_FAMILY_PREDICATES = {
+    'power':      lambda c: '/' not in c and not any(c.endswith(s) for s in ('_sl', '_coh', '_ent')),
+    'sl':         lambda c: c.endswith('_sl'),
+    'coh':        lambda c: c.endswith('_coh'),
+    'entropy':    lambda c: c.endswith('_ent'),
+    'crossfreq':  lambda c: '/' in c,
+    'node_level': lambda c: '/' not in c,   # power + sl + coh + entropy (sin ratios)
+    'all':        lambda c: True,
+}
+
+def _filter_features_by_family(X, feature_names, family, logger):
+    """Filtra columnas de X y feature_names a la familia especificada."""
+    if not family or family == 'all':
+        return X, feature_names
+    if family not in _FAMILY_PREDICATES:
+        raise ValueError(f"feature_family='{family}' desconocida. Opciones: {list(_FAMILY_PREDICATES)}")
+    mask = np.array([_FAMILY_PREDICATES[family](c) for c in feature_names])
+    X_fam = X[:, mask]
+    names_fam = [n for n, m in zip(feature_names, mask) if m]
+    logger.info(f"  Familia features '{family}': {mask.sum()}/{len(feature_names)} features")
+    return X_fam, names_fam
+
+
+# =============================================================================
 # PIPELINE POR CONDICIÓN
 # =============================================================================
 
 def run_condition(condition_name, filepath, output_dir, logger,
-                  apply_resid=False, include_age=False):
+                  apply_resid=False, include_age=False, exp_config=None,
+                  feature_family=None, residualize_sex=False):
     """
     Ejecuta el pipeline completo para una condición (feather file).
 
-    apply_resid  : elimina el efecto lineal de la edad de cada feature EEG
-                   dentro de cada fold (sin data leakage).
-    include_age  : incluye 'age' como feature explícita del modelo
-                   (condición covariates_in_model).
-
-    Nota: apply_resid e include_age son mutuamente excluyentes.
-    Si include_age=True la edad entra al modelo directamente y NO se residualiza.
+    apply_resid  : elimina el efecto lineal de la edad dentro de cada fold.
+    include_age  : incluye 'age' como feature explícita del modelo.
+    exp_config   : dict del experiments_registry. Si se provee, sus valores
+                   tienen prioridad sobre los globals GROUP1/GROUP2/APPLY_SMOTE
+                   y se guarda metadata del experimento.
 
     Retorna dict con summary, bootstrap, best_combo, n_subjects, n_pos.
     """
+    # Extraer overrides del exp_config (si existe)
+    _group1      = exp_config.get('case_label',    GROUP1)    if exp_config else GROUP1
+    _group2      = exp_config.get('control_label', GROUP2)    if exp_config else GROUP2
+    _apply_smote = exp_config.get('smote',         APPLY_SMOTE) if exp_config else APPLY_SMOTE
+    _case_orig         = exp_config.get('case_orig_labels')       if exp_config else None
+    _ctrl_orig         = exp_config.get('control_orig_labels')    if exp_config else None
+    _site_filter       = exp_config.get('site_filter')             if exp_config else None
+    _case_site_exclude = exp_config.get('case_site_exclude')       if exp_config else None
+
     tags = []
     if include_age:
         tags.append('age como feature')
     if apply_resid:
-        tags.append('residualización edad')
+        tags.append('residualizacion edad')
+    if residualize_sex:
+        tags.append('residualizacion sexo')
+    if feature_family and feature_family != 'all':
+        tags.append(f'features={feature_family}')
     tag_str = f" [{', '.join(tags)}]" if tags else ''
 
     logger.info(f"\n{'='*60}")
@@ -1272,10 +1454,24 @@ def run_condition(condition_name, filepath, output_dir, logger,
 
     # 1. Cargar y preparar datos
     X, y, feature_names, subjects, ages, data_agg = load_and_prepare(
-        filepath, GROUP1, GROUP2, logger, include_age=include_age
+        filepath, _group1, _group2, logger, include_age=include_age,
+        case_orig_labels=_case_orig, control_orig_labels=_ctrl_orig,
+        site_filter=_site_filter, case_site_exclude=_case_site_exclude,
     )
+
+    # Extraer sexes para residualización (ya codificado M=1/F=0 en load_and_prepare)
+    sexes = data_agg['sex'].values.astype(float) if (residualize_sex and 'sex' in data_agg.columns) else None
+
+    # Filtrar por familia de features (antes del prefilter de varianza)
+    X, feature_names = _filter_features_by_family(X, feature_names, feature_family, logger)
     n_subjects = len(y)
     n_pos      = int(y.sum())
+
+    # Guardar metadata del experimento (sujetos, sitios, demografía)
+    if exp_config is not None:
+        from experiment_metadata import save_experiment_metadata, print_metadata_summary
+        meta = save_experiment_metadata(data_agg, exp_config, output_dir)
+        print_metadata_summary(meta)
 
     # Guard: skip conditions with too few subjects to run stratified CV
     # Need at least 6 per class (≥ 2 folds × 3 minimum usable)
@@ -1301,7 +1497,8 @@ def run_condition(condition_name, filepath, output_dir, logger,
     summary, y_true_all, stable_features, feature_votes = run_nested_cv(
         X_filt, y, feat_filt, ages, logger,
         n_outer=N_OUTER_FOLDS, n_inner=N_INNER_FOLDS, n_iter=N_ITER_SEARCH,
-        apply_smote=APPLY_SMOTE, apply_resid=apply_resid
+        apply_smote=_apply_smote, apply_resid=apply_resid,
+        sexes=sexes, apply_sex_resid=residualize_sex,
     )
 
     print_results_table(summary, condition_name)
@@ -1315,10 +1512,19 @@ def run_condition(condition_name, filepath, output_dir, logger,
     logger.info(f"  Mejor combo: {best_combo} | "
                 f"AUC = {summary[best_combo]['auc_mean']:.3f} ± {summary[best_combo]['auc_std']:.3f}")
 
+    # ENS_soft no tiene un clasificador sklearn real → para bootstrap y modelo final
+    # se usa el mejor combo INDIVIDUAL (mayor AUC excluyendo ENS_soft)
+    single_valid = [(k, v) for k, v in valid if k != 'ENS_soft']
+    model_combo  = (max(single_valid, key=lambda x: x[1]['auc_mean'])[0]
+                    if single_valid else best_combo)
+    if model_combo != best_combo:
+        logger.info(f"  Combo para modelo final / bootstrap: {model_combo} "
+                    f"(ENS_soft no es entrenable como modelo único)")
+
     # 5. Visualizaciones del mejor combo
     best_m = summary[best_combo]
     plot_aggregated_cm(
-        best_m['cm'], [GROUP2, GROUP1], output_dir,
+        best_m['cm'], [_group2, _group1], output_dir,
         title=f'CV Aggregated CM — {condition_name}\n({best_combo})'
     )
     if len(y_true_all) > 0 and len(np.unique(y_true_all)) > 1:
@@ -1335,17 +1541,23 @@ def run_condition(condition_name, filepath, output_dir, logger,
     })
     stable_df.to_excel(os.path.join(output_dir, 'stable_features.xlsx'), index=False)
 
-    # 7. Bootstrap stability
-    bs = bootstrap_stability(X_filt, y, feat_filt, best_combo,
-                             n_bootstrap=N_BOOTSTRAP, logger=logger)
+    # 7. Bootstrap stability (usa model_combo: mejor combo INDIVIDUAL)
+    bs = bootstrap_stability(X_filt, y, feat_filt, ages, model_combo,
+                             n_bootstrap=N_BOOTSTRAP,
+                             apply_smote=_apply_smote, apply_resid=apply_resid,
+                             logger=logger,
+                             sexes=sexes, apply_sex_resid=residualize_sex)
 
-    # 8. Modelo final
+    # 8. Modelo final (usa model_combo)
     final_model, X_fs, selected_features, best_params = train_final_model(
-        X_filt, y, feat_filt, best_combo, output_dir, logger
+        X_filt, y, feat_filt, model_combo, output_dir, logger,
+        group1=_group1, group2=_group2,
+        ages=ages, apply_resid=apply_resid, apply_smote=_apply_smote,
+        sexes=sexes, apply_sex_resid=residualize_sex,
     )
 
     # 9. SAGE (primario) + SHAP beeswarm (suplementario)
-    clf_name_best = best_combo.split('_')[0]
+    clf_name_best = model_combo.split('_')[0]
     sage_analysis(
         final_model, X_fs, y, selected_features,
         output_dir, condition_name, clf_name_best, logger=logger
@@ -1380,14 +1592,47 @@ def run_condition(condition_name, filepath, output_dir, logger,
         output_dir=output_dir, logger=logger
     )
 
-    # 13. Resumen en texto
+    # 13. Resumen estructurado (JSON) — para compare_experiments.py
+    import json as _json
     elapsed = time.time() - t_start
+    results_json = {
+        'experiment_id':   exp_config.get('id', condition_name) if exp_config else condition_name,
+        'condition_name':  condition_name,
+        'best_combo':      best_combo,
+        'n_subjects':      n_subjects,
+        'n_case':          n_pos,
+        'n_control':       n_subjects - n_pos,
+        'group1':          _group1,
+        'group2':          _group2,
+        'apply_resid':     apply_resid,
+        'include_age':     include_age,
+        'apply_smote':     _apply_smote,
+        'elapsed_min':     round(elapsed / 60, 2),
+        'combos': {
+            k: {m: round(v, 4) if isinstance(v, float) else v
+                for m, v in metrics.items() if m not in ('cm', 'y_proba_all')}
+            for k, metrics in summary.items()
+        },
+        'bootstrap': {
+            'auc_mean': round(bs.get('auc_mean', float('nan')), 4),
+            'auc_std':  round(bs.get('auc_std',  float('nan')), 4),
+            'n_resamples': bs.get('n_resamples', 0),
+        },
+        'calibration': {
+            'brier': round(calib.get('brier', float('nan')), 4),
+            'ece':   round(calib.get('ece',   float('nan')), 4),
+        },
+    }
+    with open(os.path.join(output_dir, 'results_summary.json'), 'w', encoding='utf-8') as _f:
+        _json.dump(results_json, _f, indent=2, default=str)
+
+    # Resumen en texto
     summary_txt = os.path.join(output_dir, 'results_summary.txt')
     with open(summary_txt, 'w', encoding='utf-8') as f:
         f.write(f"Condición: {condition_name}\n")
         f.write(f"Residualización edad: {'Sí' if apply_resid else 'No'}\n")
         f.write(f"Archivo:   {filepath}\n")
-        f.write(f"N sujetos: {n_subjects} ({GROUP1}={n_pos}, {GROUP2}={n_subjects-n_pos})\n")
+        f.write(f"N sujetos: {n_subjects} ({_group1}={n_pos}, {_group2}={n_subjects-n_pos})\n")
         f.write(f"Features tras pre-filtro: {len(feat_filt)}\n")
         f.write(f"Mejor combo: {best_combo}\n")
         f.write(f"Tiempo total: {elapsed/60:.1f} min\n\n")

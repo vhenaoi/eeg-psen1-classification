@@ -30,7 +30,8 @@ from utils import (
 # CONFIGURATION
 # ============================================================================
 
-PATH = r'E:\Academico\Universidad\Posgrado\Tesis\Datos\PORTABLES\Resultados'
+from config import BASE_PATH as _BASE
+PATH = os.path.join(_BASE, 'Resultados')
 SPACE = 'roi'          # 'roi' or 'ic'
 DATA_TYPE = 'ce'
 ICA = '54x10'

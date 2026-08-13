@@ -3,18 +3,21 @@ pandas>=1.5
 numpy>=1.23
 scipy>=1.9
 joblib>=1.2
+pyarrow>=10.0        # lectura/escritura de .feather
+openpyxl>=3.0        # escritura de .xlsx
 
 # Machine Learning
 scikit-learn>=1.2
 imbalanced-learn>=0.10
+xgboost>=1.6
 
-# EEG harmonization
+# EEG harmonization (solo si re-corres optional_neuroharmonize.py)
 neuroHarmonize>=0.4
 
 # Visualization
 matplotlib>=3.6
 seaborn>=0.12
 
-# Optional — interpretability
+# Interpretabilidad (opcionales — el pipeline funciona sin ellos)
 shap>=0.41
 sage-importance>=0.0.4

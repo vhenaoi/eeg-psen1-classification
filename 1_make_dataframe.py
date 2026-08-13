@@ -46,24 +46,40 @@ def deduplicate_subjects(df, source_name=''):
 
     if n_duplicated > 0:
         dup_subjects = df.loc[duplicated_mask, 'subject'].unique()
-        print(f"  ⚠ Duplicates found in {source_name}: {n_duplicated} rows "
-              f"({len(dup_subjects)} subjects) → keeping first occurrence")
+        print(f"  [!] Duplicates found in {source_name}: {n_duplicated} rows "
+              f"({len(dup_subjects)} subjects) -> keeping first occurrence")
         if len(dup_subjects) <= 10:
             for s in dup_subjects:
                 subset = df[df['subject'] == s]
                 print(f"      {s}: {len(subset)} rows")
         df = df.drop_duplicates(subset='subject', keep='first')
-        print(f"    Rows: {n_before} → {len(df)}")
+        print(f"    Rows: {n_before} -> {len(df)}")
 
+    return df
+
+
+def fix_semicolon_packed(df):
+    """Fix feather files where all columns are packed into one semicolon-separated column."""
+    if df.shape[1] == 1 and ';' in df.columns[0]:
+        col_names = df.columns[0].split(';')
+        data = df.iloc[:, 0].str.split(';', expand=True)
+        data.columns = col_names
+        # Convert numeric columns
+        for col in data.columns:
+            converted = pd.to_numeric(data[col], errors='coerce')
+            if converted.notna().sum() > 0:
+                data[col] = converted
+        return data
     return df
 
 
 def load_feather(path, label):
     """Load a feather file, ensure subject column, and deduplicate."""
     df = pd.read_feather(path)
+    df = fix_semicolon_packed(df)
     df = ensure_subject_column(df)
     df = deduplicate_subjects(df, source_name=label)
-    print(f"  ✓ {label}: {df.shape}")
+    print(f"  [OK]{label}: {df.shape}")
     return df
 
 
@@ -121,7 +137,10 @@ def merge_eeg_metrics(base_path, data_type='CE', space='roi'):
 
     # Final deduplication safety check
     data_complete = deduplicate_subjects(data_complete, source_name='merged dataset')
-    print(f"  ✓ Merged shape: {data_complete.shape}")
+    print(f"  [OK]Merged shape: {data_complete.shape}")
+
+    # Preserve original group labels before mapping (needed for SCr/ACr-specific experiments)
+    data_complete['orig_group'] = data_complete['group'].copy()
 
     # Standardize group names
     if 'group' in data_complete.columns:
@@ -140,7 +159,7 @@ def merge_eeg_metrics(base_path, data_type='CE', space='roi'):
             'G1':     'PSEN1',
             'GU':     'Relative',
         }
-        data_complete['group'].replace(group_mapping, inplace=True)
+        data_complete['group'] = data_complete['group'].replace(group_mapping)
         print(f"\n  Group distribution:")
         print(data_complete['group'].value_counts())
 
@@ -176,7 +195,7 @@ def add_demographics(data, demographic_path):
     edu_ok = data_with_demo['education'].notna().sum()
     print(f"  sex      : {sex_ok:>5}/{n} subjects ({100*sex_ok//n}%)")
     print(f"  education: {edu_ok:>5}/{n} subjects ({100*edu_ok//n}%)")
-    print(f"  ✓ Final shape: {data_with_demo.shape}")
+    print(f"  [OK]Final shape: {data_with_demo.shape}")
 
     return data_with_demo
 
@@ -185,7 +204,7 @@ def save_merged_data(data, output_path):
     """Save merged dataframe"""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     data.reset_index(drop=True).to_feather(output_path)
-    print(f"\n✓ Saved merged data to: {output_path}")
+    print(f"\n[OK]Saved merged data to: {output_path}")
 
 
 # ============================================================================
@@ -194,8 +213,8 @@ def save_merged_data(data, output_path):
 
 if __name__ == "__main__":
     
-    BASE_PATH = r'E:\Academico\Universidad\Posgrado\Tesis\Datos\PORTABLES'
-    DEMOGRAPHIC_FILE = r'E:\Academico\Universidad\Posgrado\Tesis\Datos\PORTABLES\datos_filtrados_concatenados.xlsx'
+    from config import BASE_PATH
+    DEMOGRAPHIC_FILE = os.path.join(BASE_PATH, 'demo_filt.xlsx')
     
     list_data_types = ['CE']
     for i in list_data_types:

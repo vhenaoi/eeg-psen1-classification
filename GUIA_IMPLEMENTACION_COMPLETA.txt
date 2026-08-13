@@ -1,0 +1,505 @@
+"""
+GUÍA COMPLETA DE IMPLEMENTACIÓN
+Pipeline Corregido: PSM + Machine Learning para clasificación PSEN1
+================================================================================
+
+RESUMEN EJECUTIVO:
+------------------
+Este documento describe cómo implementar las correcciones al pipeline de 
+análisis que incluye:
+1. Propensity Score Matching corregido (Nearest Neighbor)
+2. Validación automática de balance demográfico (SMD)
+3. Machine Learning con detección de overfitting y age confounding
+4. Reportes comprehensivos para publicación científica
+
+PROBLEMA IDENTIFICADO EN CÓDIGO ORIGINAL:
+-----------------------------------------
+❌ El PSM no hacía matching por proximidad
+❌ Desbalance severo de edad en ratios 2:1 y 5:1 (diferencias >10 años)
+❌ Modelos aprendían a usar edad como proxy del grupo
+❌ No había validación automática de calidad del matching
+
+SOLUCIÓN IMPLEMENTADA:
+---------------------
+✅ Nearest Neighbor Matching con caliper
+✅ Validación SMD automática
+✅ Detección de age confounding
+✅ Diagnósticos comprehensivos con gráficos
+✅ Reportes listos para publicación
+
+
+================================================================================
+PARTE 1: ESTRUCTURA DE ARCHIVOS
+================================================================================
+
+Archivos Nuevos (USAR ESTOS):
+------------------------------
+1. pairs_CORRECTED.py          → Reemplaza pairs.py
+2. psm_diagnostics.py           → Nuevo módulo de diagnósticos
+3. 2_apply_psm.py               → Versión actualizada
+4. 3_train_ml_IMPROVED.py       → Versión mejorada
+
+Archivos que NO cambian:
+------------------------
+- 1_make_dataframe.py           → Ya actualizado para nuevas columnas
+- utils.py                      → Se mantiene igual
+- 4_predict_new_data.py         → Se mantiene igual
+
+
+================================================================================
+PARTE 2: PASOS DE IMPLEMENTACIÓN
+================================================================================
+
+PASO 1: BACKUP DE ARCHIVOS ORIGINALES
+--------------------------------------
+# Crear carpeta de backup
+mkdir backup_original
+cp pairs.py backup_original/
+cp 2_apply_psm.py backup_original/
+cp 3_train_ml.py backup_original/
+
+
+PASO 2: REEMPLAZAR ARCHIVOS
+---------------------------
+# Opción A: Renombrar archivos corregidos
+mv pairs_CORRECTED.py pairs.py
+mv 3_train_ml_IMPROVED.py 3_train_ml.py
+
+# Opción B: Mantener nombres explícitos (RECOMENDADO)
+# Usar pairs_CORRECTED.py y 3_train_ml_IMPROVED.py directamente
+# Modificar imports en 2_apply_psm.py si es necesario
+
+
+PASO 3: VERIFICAR DEPENDENCIAS
+------------------------------
+# Todas las dependencias ya deberían estar instaladas
+# Verificar que tienes:
+python -c "import sklearn; print(sklearn.__version__)"
+python -c "import pandas; print(pandas.__version__)"
+python -c "import numpy; print(numpy.__version__)"
+python -c "import matplotlib; print(matplotlib.__version__)"
+
+
+PASO 4: EJECUTAR PIPELINE COMPLETO
+----------------------------------
+
+A. Preparación de datos (si aún no lo hiciste):
+   python 1_make_dataframe.py
+   
+B. PSM con validación:
+   python 2_apply_psm.py
+   
+C. Entrenamiento ML:
+   python 3_train_ml.py  # o 3_train_ml_IMPROVED.py
+
+
+================================================================================
+PARTE 3: OUTPUTS ESPERADOS
+================================================================================
+
+Después de ejecutar el pipeline, tendrás:
+
+Resultados/
+├── PSM_datasets/                           # Datasets pareados
+│   ├── Data_matched_st1_roi_PSEN1_1to1.feather
+│   ├── Data_matched_st1_roi_PSEN1_2to1.feather
+│   └── Data_matched_st1_roi_PSEN1_5to1.feather
+│
+├── PSM_diagnostics/                        # Diagnósticos de calidad
+│   ├── PSEN1_1to1/
+│   │   ├── balance_table.xlsx              ← Para el paper
+│   │   └── balance_diagnostics.png         ← 6 paneles de gráficos
+│   ├── PSEN1_2to1/
+│   │   ├── balance_table.xlsx
+│   │   └── balance_diagnostics.png
+│   ├── PSEN1_5to1/
+│   │   ├── balance_table.xlsx
+│   │   └── balance_diagnostics.png
+│   └── PSEN1_diagnostic_summary.xlsx       ← Resumen de calidad
+│
+└── graphics/ML/
+    ├── PSEN1_1to1_roi/
+    │   ├── model_1to1.pkl                  # Modelo completo
+    │   ├── model_metadata_1to1.txt         # Metadatos legibles
+    │   ├── performance_summary_1to1.xlsx   # Resumen de métricas
+    │   ├── confusion_matrix_1to1.png       # Matriz de confusión
+    │   ├── roc_curve_1to1.png              # Curva ROC
+    │   ├── feature_importance_1to1.png     # Importancia de features
+    │   ├── validation_1to1.png             # Curva de aprendizaje
+    │   ├── metrics_ML_1to1.csv             # Métricas detalladas
+    │   └── demographic_summary_1to1.xlsx   # Tabla demográfica
+    ├── PSEN1_2to1_roi/
+    │   └── [mismos archivos]
+    └── PSEN1_5to1_roi/
+        └── [mismos archivos]
+
+
+================================================================================
+PARTE 4: INTERPRETACIÓN DE RESULTADOS
+================================================================================
+
+4.1 VALIDAR CALIDAD DEL PSM
+----------------------------
+
+Abrir: PSM_diagnostics/PSEN1_diagnostic_summary.xlsx
+
+Buscar:
+┌──────────────────────────────────────────────────────┐
+│ Ratio │ Max_SMD │ Quality    │ Recommendation       │
+├──────────────────────────────────────────────────────┤
+│ 1:1   │ 0.087   │ EXCELLENT  │ Use for analysis     │ ✅
+│ 2:1   │ 0.092   │ EXCELLENT  │ Use for analysis     │ ✅
+│ 5:1   │ 0.312   │ POOR       │ DO NOT USE           │ ❌
+└──────────────────────────────────────────────────────┘
+
+CRITERIOS:
+- SMD < 0.1  → EXCELLENT balance → ✅ Usar como análisis principal
+- SMD < 0.25 → ACCEPTABLE balance → ⚠ Usar con sensitivity analysis
+- SMD ≥ 0.25 → POOR balance → ❌ NO USAR
+
+
+4.2 VALIDAR BALANCE DEMOGRÁFICO
+--------------------------------
+
+Abrir: PSM_diagnostics/PSEN1_1to1/balance_table.xlsx
+
+Verificar:
+┌─────────────────────────────────────────────────────────────────┐
+│ Variable │ PSEN1_Mean │ Control_Mean │ SMD   │ Balance          │
+├─────────────────────────────────────────────────────────────────┤
+│ Age      │ 33.4       │ 33.1         │ 0.041 │ ✓ Excellent     │
+│ Sex      │ 13:28      │ 14:27        │ 0.023 │ ✓ Excellent     │
+│ Educatio │ 12.5       │ 13.8         │ 0.112 │ ⚠ Acceptable    │
+└─────────────────────────────────────────────────────────────────┘
+
+VERIFICAR:
+✓ Diferencia de edad < 3 años
+✓ Proporciones de sexo similares
+✓ SMD < 0.25 para todas las variables críticas
+
+
+4.3 VALIDAR MODELO ML
+---------------------
+
+Abrir: graphics/ML/PSEN1_1to1_roi/performance_summary_1to1.xlsx
+
+Buscar:
+┌──────────────────────────────────┐
+│ Metric      │ Value              │
+├──────────────────────────────────┤
+│ Precision   │ 0.667              │
+│ Recall      │ 0.625              │
+│ F1 Score    │ 0.645              │
+│ AUC         │ 0.734              │ ✅ Bueno
+│ CV Accuracy │ 0.695              │
+│ CV Std      │ 0.150              │
+└──────────────────────────────────┘
+
+Abrir: graphics/ML/PSEN1_1to1_roi/metrics_ML_1to1.csv
+
+VALIDAR:
+┌─────────────────────────────────────────────────────────────────┐
+│ Overfitting_Risk │ Age_Confounding                              │
+├─────────────────────────────────────────────────────────────────┤
+│ LOW              │ False                                        │
+└─────────────────────────────────────────────────────────────────┘
+
+✅ Overfitting_Risk = LOW → Ratio samples/features es bueno
+✅ Age_Confounding = False → Modelo NO usa edad como proxy
+⚠ Age_Confounding = True → REVISAR balance demográfico
+
+
+4.4 COMPARAR RATIOS
+-------------------
+
+Al final del entrenamiento, verás:
+
+COMPARATIVE PERFORMANCE:
+================================================================================
+Ratio      AUC      F1       CV Acc       Risk            Age Conf    
+================================================================================
+1:1        0.734    0.645    0.695±0.150  LOW             NO          ✅
+2:1        0.712    0.598    0.712±0.108  LOW             NO          ✅
+5:1        0.867    0.333    0.930±0.070  MODERATE        YES         ❌
+================================================================================
+
+INTERPRETACIÓN:
+- 1:1: N pequeño, pero balance perfecto → Usar como principal
+- 2:1: N mayor, balance bueno → Usar si SMD < 0.25
+- 5:1: F1 bajo, age confounding → NO USAR (incluso si AUC alto)
+
+
+================================================================================
+PARTE 5: CRITERIOS DE DECISIÓN PARA PUBLICACIÓN
+================================================================================
+
+5.1 REGLAS DE INCLUSIÓN/EXCLUSIÓN
+---------------------------------
+
+INCLUIR en análisis:
+✅ Ratio con SMD < 0.1 (EXCELLENT) → Análisis principal
+✅ Ratio con SMD < 0.25 (ACCEPTABLE) → Sensitivity analysis
+✅ Overfitting_Risk = LOW o MODERATE
+✅ Age_Confounding = False
+✅ F1 score > 0.5 (o razonable para el contexto)
+
+EXCLUIR del análisis:
+❌ SMD ≥ 0.25 (POOR balance)
+❌ Age_Confounding = True
+❌ Diferencia de edad > 5 años entre grupos
+❌ F1 score < 0.3 (modelo inútil)
+❌ Alta discordancia CV vs Test (overfitting)
+
+
+5.2 ESTRATEGIA DE PUBLICACIÓN
+-----------------------------
+
+ESCENARIO 1: Solo 1:1 tiene buen balance
+-----------------------------------------
+Main Analysis: 1:1 ratio
+- Reportar: "PSM 1:1 achieved excellent balance (SMD < 0.1)"
+- N limitado pero balance perfecto
+- AUC típicamente 0.62-0.73
+
+Paper structure:
+- Methods: "1:1 PSM matching on age and sex"
+- Results: Performance de 1:1
+- Limitations: "Sample size limited by stringent matching"
+
+
+ESCENARIO 2: Tanto 1:1 como 2:1 tienen buen balance
+----------------------------------------------------
+Main Analysis: 2:1 ratio
+Sensitivity: 1:1 ratio
+
+- Reportar: "PSM 2:1 achieved good balance (SMD < 0.25)"
+- Mayor N, mejor poder estadístico
+- Validar consistencia con 1:1
+
+Paper structure:
+- Methods: "2:1 PSM matching, validated with 1:1"
+- Results: Performance de 2:1, consistencia con 1:1
+- Strengths: "Larger sample size while maintaining balance"
+
+
+ESCENARIO 3: Todos los ratios tienen desbalance
+-----------------------------------------------
+⚠ PROBLEMA SERIO - Opciones:
+
+A. Usar solo datos sin PSM + regresión logística ajustando por edad/sexo
+B. Re-examinar criterios de inclusión
+C. Combinar sitios si tienes datos multi-site
+D. Ajustar caliper (aumentar a 0.3 o 0.4)
+
+
+5.3 TABLAS Y FIGURAS PARA EL PAPER
+-----------------------------------
+
+TABLA 1: Demographic Characteristics
+Source: PSM_diagnostics/PSEN1_1to1/balance_table.xlsx
+Include: Age, Sex, Education, MMSE, MoCA + SMD values
+
+TABLA 2: Model Performance
+Source: graphics/ML/PSEN1_1to1_roi/performance_summary_1to1.xlsx
+Include: Precision, Recall, F1, AUC, CV Accuracy
+
+FIGURA 1: Balance Diagnostics
+Source: PSM_diagnostics/PSEN1_1to1/balance_diagnostics.png
+Shows: Age distribution, Sex distribution, SMD comparison
+
+FIGURA 2: ROC Curve
+Source: graphics/ML/PSEN1_1to1_roi/roc_curve_1to1.png
+
+FIGURA 3: Confusion Matrix
+Source: graphics/ML/PSEN1_1to1_roi/confusion_matrix_1to1.png
+
+FIGURA 4 (Supplementary): Feature Importance
+Source: graphics/ML/PSEN1_1to1_roi/feature_importance_1to1.png
+
+
+================================================================================
+PARTE 6: TROUBLESHOOTING
+================================================================================
+
+PROBLEMA 1: "SMD sigue siendo > 0.25 incluso con código corregido"
+------------------------------------------------------------------
+POSIBLES CAUSAS:
+1. Distribuciones de edad muy diferentes entre grupos
+2. Muestra muy pequeña
+3. Caliper muy estricto
+
+SOLUCIONES:
+A. Aumentar caliper de 0.2 a 0.3 o 0.4:
+   matched_data = match_and_optimize(data, 'PSEN1', 'Control', '2:1', caliper=0.3)
+
+B. Verificar distribuciones:
+   # ¿Hay overlap en edad?
+   data[data['group']=='PSEN1']['age'].hist()
+   data[data['group']=='Control']['age'].hist()
+
+C. Considerar estratificación por edad:
+   # Dividir en grupos etarios antes del PSM
+
+
+PROBLEMA 2: "Age_Confounding = True en todos los modelos"
+---------------------------------------------------------
+CAUSA: El modelo está usando edad como feature discriminante
+
+VERIFICACIÓN:
+1. Revisar balance demográfico (SMD de edad debe ser < 0.1)
+2. Si SMD > 0.1, el PSM no funcionó correctamente
+3. Si SMD < 0.1 pero age_confounding = True:
+   - La edad SÍ es un feature relevante (no confounding)
+   - Esto es válido si edad está balanceada
+
+DECISIÓN:
+- Si SMD_edad < 0.1 Y Age_Confounding = True → OK, age es feature real
+- Si SMD_edad > 0.1 Y Age_Confounding = True → NO OK, confusión
+
+
+PROBLEMA 3: "Overfitting_Risk = HIGH"
+--------------------------------------
+CAUSA: Muy pocos sujetos para el número de features
+
+SOLUCIONES:
+A. Reducir features más agresivamente
+B. Usar ratio mayor (2:1 en lugar de 1:1)
+C. Simplificar modelo (menos hyperparameters)
+D. Reportar honestamente en limitations
+
+
+PROBLEMA 4: "F1 Score muy bajo (<0.3) pero AUC alto (>0.8)"
+-----------------------------------------------------------
+CAUSA TÍPICA: Imbalance de clases extremo + modelo predice mayoría
+
+VERIFICACIÓN:
+# Ver matriz de confusión
+# Si predice casi todo como una clase → problema
+
+SOLUCIÓN:
+- Revisar class_weight='balanced' en hyperparameters
+- Considerar SMOTE para oversampling
+- Usar ratio más balanceado (1:1)
+
+
+PROBLEMA 5: "Código corre pero no genera diagnósticos"
+------------------------------------------------------
+VERIFICACIÓN:
+En 2_apply_psm.py, línea ~45:
+    RUN_DIAGNOSTICS = True  # Debe estar en True
+
+Si está en True pero no genera:
+- Verificar permisos de escritura en directorio
+- Revisar errores en consola
+- Verificar que psm_diagnostics.py está en el mismo directorio
+
+
+================================================================================
+PARTE 7: CHECKLIST FINAL ANTES DE PUBLICACIÓN
+================================================================================
+
+CALIDAD DE DATOS:
+□ SMD < 0.1 para edad en ratio principal
+□ SMD < 0.25 para todas las variables en ratio principal
+□ Diferencia de edad < 3 años entre grupos
+□ Proporciones de sexo similares (diferencia < 10%)
+□ N mínimo de 60 sujetos totales (30 por grupo en 1:1)
+
+CALIDAD DE MODELO:
+□ Overfitting_Risk = LOW o MODERATE
+□ Age_Confounding = False (o justificado si True)
+□ CV Accuracy consistente con Test Performance (diff < 0.15)
+□ F1 Score > 0.4 (mínimo razonable)
+□ AUC > 0.6 (mejor si > 0.7)
+
+REPORTES:
+□ Tablas demográficas generadas
+□ Gráficos de balance disponibles
+□ Métricas de performance guardadas
+□ Modelo .pkl guardado con metadata
+□ Confusion matrix y ROC curve generadas
+
+DOCUMENTACIÓN:
+□ Versión de código documentada
+□ Hyperparameters registrados
+□ Features seleccionados listados
+□ Criterios de inclusión/exclusión claros
+
+
+================================================================================
+PARTE 8: EJEMPLO DE SECCIÓN DE MÉTODOS PARA EL PAPER
+================================================================================
+
+PROPUESTA DE TEXTO:
+
+"Data Processing and Matching
+------------------------------
+Propensity score matching (PSM) was performed to balance demographic 
+covariates between PSEN1 mutation carriers and non-carriers. Propensity 
+scores were estimated using logistic regression with age and sex as 
+covariates. Nearest neighbor matching with a caliper of 0.2 standard 
+deviations was employed to select matched controls for each PSEN1 carrier 
+[1:1 ratio / 2:1 ratio]. 
+
+Balance assessment was conducted using standardized mean differences (SMD), 
+with SMD < 0.1 indicating excellent balance and SMD < 0.25 indicating 
+acceptable balance [ref: Austin 2011]. After matching, [X] PSEN1 carriers 
+and [Y] controls were included, achieving excellent balance on age 
+(SMD = 0.XX) and sex (SMD = 0.XX).
+
+Machine Learning Classification
+--------------------------------
+Random Forest classification was performed using the matched dataset. 
+Features included EEG-derived metrics (power, entropy, coherence, 
+synchronization likelihood, and cross-frequency coupling) across frequency 
+bands and regions of interest, as well as age, sex, and education.
+
+Hyperparameter optimization was conducted using randomized search with 
+10-fold stratified cross-validation. The final model used [X] features 
+selected based on importance rankings and incremental performance evaluation. 
+Model performance was assessed on a held-out test set (20% of data) using 
+precision, recall, F1-score, and area under the ROC curve (AUC).
+
+To assess overfitting risk, we calculated the ratio of training samples to 
+features. Ratios ≥10 indicated low risk, 5-10 moderate risk, and <5 high 
+risk. We also monitored for potential age confounding by examining feature 
+importance rankings."
+
+
+Referencias sugeridas:
+Austin, P. C. (2011). An introduction to propensity score methods for 
+reducing the effects of confounding in observational studies. 
+Multivariate behavioral research, 46(3), 399-424.
+
+
+================================================================================
+RESUMEN FINAL
+================================================================================
+
+Has recibido:
+✅ 4 archivos de código corregidos
+✅ Análisis científico completo de tus resultados preliminares
+✅ Guía de implementación paso a paso
+✅ Criterios de validación de calidad
+✅ Estrategia de publicación
+✅ Troubleshooting guide
+✅ Template para sección de métodos
+
+PRÓXIMOS PASOS RECOMENDADOS:
+1. [Hoy] Implementar código corregido
+2. [Mañana] Re-run pipeline en una condición (ej: CE)
+3. [Día 2] Validar que SMD < 0.25 en al menos un ratio
+4. [Día 3-4] Re-run todas las condiciones si validación es exitosa
+5. [Semana 2] Comparar resultados viejos vs nuevos
+6. [Semana 3] Escribir paper con mejores resultados
+
+EXPECTATIVAS REALISTAS:
+- 1:1 debería dar SMD < 0.1 (excelente)
+- 2:1 debería dar SMD < 0.25 (aceptable) con código corregido
+- 5:1 puede aún tener problemas si hay poca overlap en edad
+- Performance (AUC) puede ser similar o ligeramente mejor
+- La VALIDEZ científica será MUCHO mayor
+
+¡Éxito con la implementación!
+================================================================================
+"""

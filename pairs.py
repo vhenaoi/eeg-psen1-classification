@@ -335,7 +335,7 @@ def match_and_optimize(data, group1, group2, ratio_str='2:1', caliper=0.2,
 
 def parse_ratio(ratio_str):
     """Parse ratio string to multiplier"""
-    ratio_map = {'1:1': 1, '2:1': 2, '5:1': 5, '10:1': 10}
+    ratio_map = {'1:1': 1, '2:1': 2, '4:1': 4, '5:1': 5, '10:1': 10}
     multiplier = ratio_map.get(ratio_str)
     
     if multiplier is None:
