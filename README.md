@@ -1,191 +1,72 @@
-# EEG Resting-State Biomarkers for Pre-symptomatic PSEN1 Mutation Detection
+# Low-density EEG classification of PSEN1 E280A carriers
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![License](https://img.shields.io/badge/License-MIT-green)
+Code for the analyses of the manuscript *Low-density EEG classification of asymptomatic and symptomatic PSEN1 E280A carriers in a Latin American familial cohort: a harmonized multisite machine learning study* (submitted to Frontiers in Neurology; Research Topic "AI-Enhanced Neuroimaging: Transforming Neurodegenerative Disease Management").
 
-Machine learning pipeline for classifying **PSEN1 familial Alzheimer's disease mutation carriers** vs. healthy controls using resting-state EEG. Designed for multi-site data with rigorous confound control.
+The study classifies **asymptomatic (ACr, n = 91)** and **symptomatic (SCr, n = 47)** PSEN1 E280A carriers against **683 healthy controls (HC)** from ten recording sites, using 544 resting-state EEG features computed from an eight-channel montage. All carriers were recorded in Medellín (Colombia); controls come from three Medellín sites and seven public or collaborating cohorts, so carrier status is partly confounded with recording site. The code addresses this with a reference-based harmonization and a set of sensitivity analyses.
 
-**Primary result:** AUC = 0.892 ± 0.059 (PSM 1:1, Random Forest + RFE, nested 10×5-fold CV)
+> **Status.** This repository replaces an earlier version of the analysis (matched controls, headline AUC 0.892) that is no longer the basis of the manuscript. The earlier files are kept unchanged in [`legacy_2026-08/`](legacy_2026-08/) for provenance.
 
----
+## Repository layout
 
-## Scientific Context
+| Path | Content |
+|---|---|
+| `pipeline/` | Final analysis code (nested cross-validation, feature importance, sensitivity analyses). |
+| `results/` | Aggregated results only (mean ± SD over five cross-validation partitions). No participant-level data. |
+| `legacy_2026-08/` | Previous pipeline and its scripts (1_make_dataframe, PSM, harmonization, reports). |
 
-PSEN1 (presenilin-1) mutation carriers develop familial Alzheimer's disease with 100% penetrance, typically between ages 30–45. Identifying pre-symptomatic EEG biomarkers is clinically relevant for early monitoring.
+## Pipeline (`pipeline/`)
 
-**Core challenge:** All PSEN1 carriers come from a single site (Medellín, Colombia), while controls span 10 international sites. This confounds GROUP with SITE, which breaks standard harmonization approaches (see *Reference-Based Harmonization* below).
+1. **Input.** A participant × feature table (`.feather`) with the 544 EEG features, `group`, `orig_group`, `SITE`, `age` and `sex`. Features are computed upstream with APPLEE ([github.com/GRUNECO/portables](https://github.com/GRUNECO/portables)); the harmonized table is produced by reference-based ComBat (site effects learned on controls only and applied to all participants; see `legacy_2026-08/optional_neuroharmonize.py`). The data are **not** included (see *Data availability*).
+2. **Classification** (`3_train_ml_v2.py`). Nested cross-validation (10 outer × 5 inner folds). Inside each training fold: kNN imputation, linear residualization of age, z-scoring and, where specified, SMOTE. Classifiers: random forest, SVM, logistic regression, XGBoost and a soft-voting ensemble, each with ANOVA or RFE feature selection and a randomized hyperparameter search. Age is the only covariate; sex is not used because it is missing for 315 of 821 participants.
+3. **Experiments** (`experiments_registry.py`, `run_experiments.py`). Every analysis is a registry entry; `python run_experiments.py --ids E05 E03` runs a subset. `CV_SEED` (environment variable, default 42) changes the cross-validation partition; the manuscript reports mean ± SD over seeds 42 and 1–4. `run_parallel.py` runs experiments in parallel. Each run writes `oof_predictions.csv` (out-of-fold predictions per participant) to its output folder; these files contain participant-level information and are not included here.
+4. **Post hoc analyses.**
+   - `oof_site_stratified_auc.py`: AUC of the out-of-fold predictions restricted to Medellín participants, per site and in the age range shared by carriers and controls.
+   - `partial_confounder_test_v2.py`: partial confounder test ([mlconfound](https://github.com/pni-lab/mlconfound); Spisak, GigaScience 2022) on the out-of-fold predictions averaged over partitions. Sex is evaluated only in participants with recorded sex.
+   - `effect_sizes_median_g.py`: Hedges' g for each feature, summarized by the median |g| with bootstrap interval and permutation null.
 
-**Key methodological contributions:**
-- Reference-based two-step ComBat: site effects estimated from controls only, applied to all subjects
-- Propensity Score Matching (PSM) on age to control the 28-year group age gap
-- Nested cross-validation with within-fold age residualization
-- SAGE (Shapley Additive Global importancE) for statistically rigorous feature importance with 95% CI
+## Mapping between manuscript analyses and experiment IDs
 
----
+| Manuscript analysis | SCr vs HC | ACr vs HC |
+|---|---|---|
+| Primary model (age residualized) | E05 | E03 |
+| No age adjustment | E12 | E11 |
+| Earlier variance filter | E05L | — |
+| Spectral power only | E21 | E15 |
+| Synchronization likelihood only | E22 | E16 |
+| Coherence only | E23 | E17 |
+| Permutation entropy only | E24 | E18 |
+| Cross-frequency amplitude modulation only | E25 | E19 |
+| Node-level features only | E26 | E20 |
+| Portable-device participants excluded | E32 | E33 (combined carriers: E29 vs E31) |
+| Age-comparable controls | E30 | E63 |
+| Same-site controls (65 Medellín) | E34 | E35 |
+| Without ComBat | E36 | E37 |
+| Cross-fitted ComBat | E41 | E40 |
+| Label permutation | — | E57–E59 (harmonized), E52–E56 (unharmonized) |
+| One control site removed (Seoul, Dortmund, Cuba, Poland, small sites) | E75–E79 | E70–E74 |
+| Medellín vs other controls, no carriers (without / with ComBat) | E50 / E51 | |
+| Age 20–45 years (without / with ComBat) | | E60 / E61 |
+| ACr vs HC_ACr without ComBat | | E62 |
+| Within each Medellín site | E67–E69 | E64–E66 |
 
-## Pipeline
-
-```
-Raw EEG features (.feather)
-        │
-        ▼
-1_make_dataframe.py        ← merge 5 metrics + demographics
-        │
-        ▼
-optional_neuroharmonize.py ← reference-based ComBat (controls only → all)
-        │
-        ▼
-2_apply_psm.py             ← Propensity Score Matching on age
-        │
-        ▼
-3_train_ml_v2.py           ← nested CV + RF/SVM/LR + SAGE + SHAP + robustness
-        │
-        ▼
-4_predict_new_data.py      ← inference on new subjects
-```
-
----
+Aggregated values for every row are in `results/summary_5partitions.csv` (cross-validated and bootstrap AUC, mean and SD over the five partitions). The other files in `results/` contain the within-Medellín evaluation (`within_medellin_auc.csv`), the effect sizes (`effect_size_median_g.csv`) and the partial confounder test (`partial_confounder_test.csv`).
 
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+pip install -r pipeline/requirements.txt
 ```
 
-`shap` and `sage-importance` are optional (interpretability only):
-```bash
-pip install shap sage-importance
-```
+`mlconfound` depends on `pygam`, which uses a `scipy.sparse` attribute removed in recent SciPy versions; `partial_confounder_test_v2.py` includes a small compatibility shim.
 
----
+## Data availability
 
-## Configuration
+The EEG recordings are not distributed here. The control cohorts are public (for example, the Cuban Human Brain Mapping Project at <https://chbmp-open.loris.ca/>). The Medellín recordings are not publicly available at the time of submission; they can be shared after acceptance of the article, or earlier under a data-sharing agreement, upon request to the corresponding author (John Fredy Ochoa Gómez, john.ochoa@udea.edu.co).
 
-Every script has a `BASE_PATH` constant at the top. Set it to your local data root before running:
+## Known limitations of this release
 
-```python
-# In each script, update this line:
-BASE_PATH = r'C:\your\path\to\data'
-```
-
-The expected directory structure under `BASE_PATH`:
-
-```
-BASE_PATH/
-├── Resultados/
-│   ├── Data_complete_ce_roi.feather          ← output of step 1
-│   ├── Data_complete_ce_roi_HARMONIZED.feather ← output of step 2
-│   ├── PSM_datasets/                         ← output of step 3
-│   │   ├── Data_matched_ce_roi_PSEN1_1to1.feather
-│   │   ├── Data_matched_ce_roi_PSEN1_2to1.feather
-│   │   └── Data_matched_ce_roi_PSEN1_5to1.feather
-│   └── graphics/
-│       └── ML_v2/                            ← output of step 4
-└── datos_filtrados_concatenados.xlsx         ← demographics file
-```
-
----
-
-## Data Format
-
-Input feather files must have one row per EEG epoch/segment per subject, with columns:
-
-| Column | Description |
-|---|---|
-| `subject` | Subject identifier |
-| `group` | `'PSEN1'` or `'Control'` |
-| `SITE` | Acquisition site label |
-| `age` | Age in years |
-| `sex` | `'M'` / `'F'` (optional) |
-| `[feature columns]` | EEG metrics (power, sl, coherence, entropy, crossfreq) |
-
-Subjects are aggregated to **mean per subject** at training time.
-
----
-
-## Usage
-
-Run scripts in order:
-
-```bash
-# Step 1 — Build unified dataframe
-python 1_make_dataframe.py
-
-# Step 2 — Reference-based site harmonization (optional but recommended)
-python optional_neuroharmonize.py
-
-# Step 3 — Propensity Score Matching
-python 2_apply_psm.py
-
-# Step 4 — ML training (nested CV, 8 conditions, SAGE + SHAP)
-python 3_train_ml_v2.py
-
-# Step 4b — Run SAGE on existing models without re-training
-python run_sage_only.py
-
-# Step 5 — Predict on new subjects
-python 4_predict_new_data.py
-```
-
----
-
-## Reference-Based Harmonization
-
-Standard ComBat applied jointly to all subjects fails here: PSEN1 carriers are 100% from Medellín, so the Medellin site-effect estimate absorbs disease-related EEG differences (empirically: −0.101 AUC vs. reference-based approach).
-
-**Two-step solution (`optional_neuroharmonize.py`):**
-1. `harmonizationLearn` on **controls only** → estimates site effects from healthy subjects
-2. `harmonizationApply` to **all subjects** → applies the correction without contamination
-
----
-
-## Experimental Conditions
-
-| Condition | Data | Age handling | N |
-|---|---|---|---|
-| `covariates_in_model` | Full sample | age as feature | 539 |
-| `residualization` | Full sample | age residualized per fold | 539 |
-| `psm_1to1_residualization` ⭐ | PSM 1:1 | age residualized per fold | 160 |
-| `psm_1to1_covariates` | PSM 1:1 | age as feature | 160 |
-| `psm_2to1_residualization` | PSM 2:1 | age residualized per fold | 147 |
-| `psm_2to1_covariates` | PSM 2:1 | age as feature | 147 |
-| `psm_5to1_residualization` | PSM 5:1 | age residualized per fold | 120 |
-| `psm_5to1_covariates` | PSM 5:1 | age as feature | 120 |
-
-⭐ Primary condition.
-
----
-
-## Results
-
-### Classification Performance (best combo per condition)
-
-| Condition | AUC (CV) | Bootstrap AUC | Model |
-|---|---|---|---|
-| covariates_in_model | 0.974 ± 0.015 | 0.977 ± 0.008 | RF_rfe |
-| residualization | 0.963 ± 0.015 | 0.926 ± 0.024 | RF_rfe |
-| **psm_1to1_residualization** ⭐ | **0.892 ± 0.059** | **0.882 ± 0.055** | RF_rfe |
-| psm_1to1_covariates | 0.905 ± 0.057 | 0.881 ± 0.039 | RF_rfe |
-| psm_2to1_residualization | 0.847 ± 0.152 | 0.808 ± 0.056 | LR_rfe |
-| psm_2to1_covariates | 0.880 ± 0.068 | 0.870 ± 0.046 | RF_rfe |
-
-### Top SAGE Features — Primary Condition (psm_1to1_residualization)
-
-| Feature | SAGE Value | 95% CI | Interpretation |
-|---|---|---|---|
-| C3_Beta3 | 0.088 ± 0.002 | [0.085, 0.092] | Central Beta-3 power (~25–30 Hz) |
-| O2_Beta1/MDelta | 0.059 ± 0.002 | [0.055, 0.062] | Occipital cross-frequency ratio |
-| O1_Theta_coh | 0.053 ± 0.001 | [0.051, 0.055] | Occipital theta coherence |
-
-All SAGE values have CI > 0, confirming statistical informativeness. SAGE/SHAP agreement: Spearman ρ > 0.90 in primary conditions.
-
----
-
-## Citation
-
-> [Manuscript in preparation] — PSEN1 EEG ML study, 2026.
-
----
+- The script that builds the cross-fitted ComBat table (used for the cross-fitting analysis) is not included yet.
+- The upstream feature-extraction code is in the APPLEE repository, not here.
 
 ## License
 

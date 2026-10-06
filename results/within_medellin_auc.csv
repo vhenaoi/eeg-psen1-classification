@@ -1,0 +1,9 @@
+exp,subset,n_pos,n_neg,auc,ci_low,ci_high,auc_age_alone
+E03,Medellin (all),91,65,0.753,0.669,0.83,0.782
+E03,"Medellin, age range 22-44",84,31,0.664,0.536,0.786,0.57
+E05,Medellin (all),47,65,0.84,0.766,0.911,0.646
+E05,"Medellin, age range 40-81",44,42,0.827,0.735,0.904,0.528
+E40,Medellin (all),91,65,0.754,0.672,0.831,0.782
+E40,"Medellin, age range 22-44",84,31,0.676,0.548,0.795,0.57
+E41,Medellin (all),47,65,0.833,0.757,0.903,0.646
+E41,"Medellin, age range 40-81",44,42,0.818,0.729,0.898,0.528

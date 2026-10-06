@@ -4,6 +4,8 @@
 *.pkl.gz
 *.h5
 *.csv
+# Aggregated results only (no participant-level data): the files in results/ were checked for subject identifiers
+!results/*.csv
 *.xlsx
 *.xls
 
