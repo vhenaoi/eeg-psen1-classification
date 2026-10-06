@@ -1,6 +1,6 @@
 # Low-density EEG classification of PSEN1 E280A carriers
 
-Code for the analyses of the manuscript *Low-density EEG classification of asymptomatic and symptomatic PSEN1 E280A carriers in a Latin American familial cohort: a harmonized multisite machine learning study* (submitted to Frontiers in Neurology; Research Topic "AI-Enhanced Neuroimaging: Transforming Neurodegenerative Disease Management").
+Code for the analyses of a manuscript in preparation for Frontiers in Neurology (Research Topic "AI-Enhanced Neuroimaging: Transforming Neurodegenerative Disease Management").
 
 The study classifies **asymptomatic (ACr, n = 91)** and **symptomatic (SCr, n = 47)** PSEN1 E280A carriers against **683 healthy controls (HC)** from ten recording sites, using 544 resting-state EEG features computed from an eight-channel montage. All carriers were recorded in Medellín (Colombia); controls come from three Medellín sites and seven public or collaborating cohorts, so carrier status is partly confounded with recording site. The code addresses this with a reference-based harmonization and a set of sensitivity analyses.
 
